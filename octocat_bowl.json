@@ -1,0 +1,80 @@
+{
+ "boundary_conditions": {
+  "rhs": [
+   0,
+   9.81,
+   0
+  ]
+ },
+ "common": "common.json",
+ "geometry": [
+  {
+   "array": {
+    "offset": 1.75,
+    "size": [
+     1,
+     3,
+     1
+    ]
+   },
+   "mesh": "meshes/octocat.msh",
+   "transformation": {
+    "rotation": [
+     -90,
+     0,
+     0
+    ],
+    "scale": 0.05,
+    "translation": [
+     0,
+     4.25,
+     0
+    ]
+   },
+   "type": "mesh_array"
+  },
+  {
+   "is_obstacle": true,
+   "mesh": "meshes/bowl.obj",
+   "type": "mesh"
+  }
+ ],
+ "materials": {
+  "E": 100000.0,
+  "nu": 0.4,
+  "rho": 1000,
+  "type": "NeoHookean"
+ },
+ "time": {
+  "dt": 0.07,
+  "time_steps": 22
+ },
+ "solver": {
+  "linear": {
+   "solver": "Eigen::CholmodSupernodalLLT"
+  },
+  "contact": {
+   "CCD": {
+    "broad_phase": "bvh"
+   }
+  },
+  "nonlinear": {
+   "max_iterations": 10000,
+   "solver": "NonsmoothNewton"
+  }
+ },
+ "output": {
+  "stats": true,
+  "paraview": {
+   "file_name": ""
+  },
+  "log": {
+   "level": "info",
+   "file_level": "off",
+   "path": ""
+  },
+  "advanced": {
+   "save_time_sequence": false
+  }
+ }
+}

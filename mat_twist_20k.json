@@ -1,0 +1,101 @@
+{
+ "common": "common.json",
+ "geometry": [
+  {
+   "mesh": "meshes/mat100x100t40.msh",
+   "transformation": {
+    "translation": [
+     0,
+     0,
+     0
+    ],
+    "rotation": [
+     90,
+     0,
+     0
+    ]
+   },
+   "volume_selection": 1,
+   "surface_selection": [
+    {
+     "id": 1,
+     "axis": 1,
+     "position": 0.5
+    },
+    {
+     "id": 3,
+     "axis": -1,
+     "position": -0.5
+    }
+   ]
+  }
+ ],
+ "time": {
+  "dt": 0.04,
+  "time_steps": 100
+ },
+ "boundary_conditions": {
+  "rhs": [
+   0,
+   0,
+   0
+  ],
+  "dirichlet_boundary": [
+   {
+    "id": 1,
+    "value": [
+     0,
+     "y*cos((-0.4*pi)*t)-z*sin((-0.4*pi)*t)-y",
+     "y*sin((-0.4*pi)*t)+z*cos((-0.4*pi)*t)-z"
+    ]
+   },
+   {
+    "id": 3,
+    "value": [
+     0,
+     "y*cos((0.4*pi)*t)-z*sin((0.4*pi)*t)-y",
+     "y*sin((0.4*pi)*t)+z*cos((0.4*pi)*t)-z"
+    ]
+   }
+  ]
+ },
+ "materials": [
+  {
+   "id": 1,
+   "E": 20000,
+   "nu": 0.4,
+   "rho": 1000,
+   "type": "NeoHookean"
+  }
+ ],
+ "solver": {
+  "linear": {
+   "solver": "Eigen::CholmodSupernodalLLT"
+  },
+  "contact": {
+   "CCD": {
+    "broad_phase": "bvh"
+   }
+  },
+  "nonlinear": {
+   "solver": "NonsmoothNewton"
+  }
+ },
+ "output": {
+  "stats": true,
+  "paraview": {
+   "file_name": ""
+  },
+  "log": {
+   "level": "info",
+   "file_level": "off",
+   "path": ""
+  },
+  "advanced": {
+   "save_time_sequence": false
+  }
+ },
+ "contact": {
+  "dhat": 0.001
+ }
+}

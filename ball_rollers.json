@@ -1,0 +1,184 @@
+{
+ "common": "common.json",
+ "geometry": [
+  {
+   "mesh": "meshes/sphere5K.msh",
+   "volume_selection": 1,
+   "surface_selection": 0,
+   "transformation": {
+    "scale": 1.0,
+    "translation": [
+     0.75,
+     1.45,
+     0.75
+    ]
+   }
+  },
+  {
+   "mesh": "meshes/cylinder.obj",
+   "is_obstacle": true,
+   "surface_selection": 1000,
+   "transformation": {
+    "scale": 2.0,
+    "translation": [
+     1.0,
+     0.7,
+     0.5
+    ]
+   }
+  },
+  {
+   "mesh": "meshes/cylinder.obj",
+   "is_obstacle": true,
+   "surface_selection": 1001,
+   "transformation": {
+    "scale": 2.0,
+    "translation": [
+     1.0,
+     0.7,
+     1.0
+    ]
+   }
+  },
+  {
+   "mesh": "meshes/cylinder.obj",
+   "is_obstacle": true,
+   "surface_selection": 1002,
+   "transformation": {
+    "scale": 2.0,
+    "translation": [
+     0.5,
+     0.19999999999999996,
+     1.0
+    ],
+    "rotation": [
+     0,
+     90,
+     0
+    ]
+   }
+  },
+  {
+   "mesh": "meshes/cylinder.obj",
+   "is_obstacle": true,
+   "surface_selection": 1003,
+   "transformation": {
+    "scale": 2.0,
+    "translation": [
+     1.0,
+     0.19999999999999996,
+     1.0
+    ],
+    "rotation": [
+     0,
+     90,
+     0
+    ]
+   }
+  },
+  {
+   "mesh": "meshes/plane.obj",
+   "is_obstacle": true,
+   "surface_selection": 1004,
+   "transformation": {
+    "translation": [
+     1.0,
+     -1.5,
+     1.0
+    ],
+    "dimensions": [
+     20.0,
+     0,
+     20.0
+    ]
+   }
+  }
+ ],
+ "boundary_conditions": {
+  "obstacle_displacements": [
+   {
+    "id": 1000,
+    "value": [
+     0,
+     "rotate_2D_x((y - 0.7), (z - 0.5), 1.5707963267948966 * t) - (y - 0.7)",
+     "rotate_2D_y((y - 0.7), (z - 0.5), 1.5707963267948966 * t) - (z - 0.5)"
+    ]
+   },
+   {
+    "id": 1001,
+    "value": [
+     0,
+     "rotate_2D_x((y - 0.7), (z - 1.0), -1.5707963267948966 * t) - (y - 0.7)",
+     "rotate_2D_y((y - 0.7), (z - 1.0), -1.5707963267948966 * t) - (z - 1.0)"
+    ]
+   },
+   {
+    "id": 1002,
+    "value": [
+     "rotate_2D_x((x - 0.5), (y - 0.19999999999999996), -1.5707963267948966 * t) - (x - 0.5)",
+     "rotate_2D_y((x - 0.5), (y - 0.19999999999999996), -1.5707963267948966 * t) - (y - 0.19999999999999996)",
+     0
+    ]
+   },
+   {
+    "id": 1003,
+    "value": [
+     "rotate_2D_x((x - 1.0), (y - 0.19999999999999996), 1.5707963267948966 * t) - (x - 1.0)",
+     "rotate_2D_y((x - 1.0), (y - 0.19999999999999996), 1.5707963267948966 * t) - (y - 0.19999999999999996)",
+     0
+    ]
+   }
+  ],
+  "rhs": [
+   0,
+   9.80665,
+   0
+  ]
+ },
+ "materials": [
+  {
+   "id": 1,
+   "E": 10000,
+   "nu": 0.4,
+   "rho": 1000,
+   "type": "NeoHookean"
+  }
+ ],
+ "time": {
+  "dt": 0.01,
+  "time_steps": 150
+ },
+ "contact": {
+  "dhat": 0.0017312317551931775,
+  "epsv": 0.0017312317551931775,
+  "friction_coefficient": 0.5
+ },
+ "solver": {
+  "linear": {
+   "solver": "Eigen::CholmodSupernodalLLT"
+  },
+  "contact": {
+   "CCD": {
+    "broad_phase": "bvh"
+   }
+  },
+  "nonlinear": {
+   "max_iterations": 10000,
+   "solver": "NonsmoothNewton"
+  }
+ },
+ "output": {
+  "stats": true,
+  "paraview": {
+   "file_name": ""
+  },
+  "log": {
+   "level": "info",
+   "file_level": "off",
+   "path": ""
+  },
+  "advanced": {
+   "save_time_sequence": false
+  }
+ }
+}
