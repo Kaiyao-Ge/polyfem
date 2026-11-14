@@ -29,11 +29,13 @@ mkdir -p out/golf
 ./build/PolyFEM_bin -j golf_ball.json -o out/golf --max_threads 8
 ```
 
-Timings and Newton statistics go to `out/golf/sim.json`.
+Per time step, `out/golf/sim.json` → `solver_info` holds the solve time (`total_time`) and, for the method, the counters under `NonsmoothNewton` (factorizations, back substitutions, inner steps, hand-backs, ...). `out/golf/stats.csv` has the wall time and peak memory per step.
 
 Settings in every scene:
 
-- `solver.nonlinear.solver = "NonsmoothNewton"` runs the method. Set it to `"Newton"` for the baseline; everything else stays the same.
+- `solver.nonlinear.solver = "NonsmoothNewton"` runs the method.
+- Baseline of the benchmark: keep the solver name and add `"NonsmoothNewton": {"debug": {"method": false}}` under `solver.nonlinear`. This runs the Newton chain (Newton, projected Newton, regularized Newton, gradient descent) with the same certified CCD as the method. The benchmark baseline also used the fast element-validity check in the line search (about 1% of its time); the PR code uses the native check there.
+- `"solver": "Newton"` is stock PolyFEM with the standard CCD. The benchmark speedups were not measured against it.
 - Linear solver `Eigen::CholmodSupernodalLLT`, as in the benchmark. On a Mac, `Eigen::AccelerateLDLT` also works but gives different timings.
 - `common.json` carries the shared defaults: contact on, lumped mass, RobustArmijo line search.
 - ParaView output is off (`output.paraview.file_name` is empty). Set it to `"sim.pvd"` to write frames.
