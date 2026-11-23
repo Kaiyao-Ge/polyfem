@@ -7,6 +7,9 @@
 #include <polyfem/Common.hpp>
 #include <polyfem/io/ResourceIO.hpp>
 #include <polyfem/solver/BarrierContactNonsmoothTerm.hpp>
+#include <polyfem/solver/nonsmooth/BasisRepair.hpp>
+#include <polyfem/solver/nonsmooth/blind/BlindUnitTerm.hpp>
+#include <polyfem/solver/nonsmooth/blind/LocalMass.hpp>
 #include <polyfem/solver/NLProblem.hpp>
 #include <polyfem/solver/forms/FrictionForm.hpp>
 #include <polyfem/utils/JSONUtils.hpp>
@@ -320,21 +323,144 @@ TEST_CASE("nonsmooth_newton_contact_blind_selection", NONSMOOTH_NEWTON_SIM_TAGS)
 
 TEST_CASE("nonsmooth_newton_contact_blind_rejects_unsupported", NONSMOOTH_NEWTON_SIM_TAGS)
 {
+	// friction and the augmented Lagrangian stage are supported by the blind selection; what has no node-local split stops the run
+	// (blind/unsupported_forms = error) or stays in the frozen part (remainder)
 	using Catch::Matchers::ContainsSubstring;
-	SECTION("friction")
+	SECTION("lagged form other than friction")
 	{
 		json args = five_cubes(2, "NonsmoothNewton", "");
 		args["/solver/nonlinear/NonsmoothNewton/selection"_json_pointer] = "blind";
-		args["/contact/friction_coefficient"_json_pointer] = 0.3;
-		CHECK_THROWS_WITH(run(args), ContainsSubstring("friction"));
+		args["/solver/rayleigh_damping"_json_pointer] = json::array({json{{"form", "elasticity"}, {"stiffness_ratio", 0.1}}});
+		CHECK_THROWS_WITH(run(args), ContainsSubstring("lagged forms other than friction"));
 	}
-	SECTION("augmented Lagrangian subproblems")
+}
+
+TEST_CASE("nonsmooth_newton_contact_blind_consistent_mass", NONSMOOTH_NEWTON_SIM_TAGS)
+{
+	// the element blocks of the consistent mass (one call of Mass::assemble per entry, the inputs of the assembly loop) add up to the mass
+	// matrix, and the blind selection with the consistent mass solves the stack without intersections
+	class MassChecked : public CheckedTransientVarForm
 	{
-		json args = five_cubes_pushed(8, "NonsmoothNewton", "");
+	public:
+		using CheckedTransientVarForm::CheckedTransientVarForm;
+		double mismatch = -1;
+
+	protected:
+		void solve_tensor_nonlinear(int step, Eigen::MatrixXd &sol, bool init_lagging = true) override
+		{
+			CheckedTransientVarForm::solve_tensor_nonlinear(step, sol, init_lagging);
+			if (step == 1)
+			{
+				const auto lm = solver::LocalMass::build(*mass_assembler_, mesh_->is_volume(), space_.basis_list(), space_.geometry_basis_list(), mass_ass_vals_cache_);
+				mismatch = lm->mismatch(mass_, mesh_->dimension());
+			}
+		}
+	};
+	const int steps = 10;
+	json args = five_cubes(steps, "NonsmoothNewton", "");
+	args["/solver/advanced/lump_mass_matrix"_json_pointer] = false;
+	args["/solver/nonlinear/NonsmoothNewton/selection"_json_pointer] = "blind";
+	std::shared_ptr<CheckedTransientVarForm> checked;
+	const Eigen::MatrixXd sol = run(args, &checked, [](const io::ResourceIO &r) { return std::make_shared<MassChecked>(r); });
+	REQUIRE(sol.allFinite());
+	CHECK(!checked->intersecting);
+	const auto mc = std::dynamic_pointer_cast<MassChecked>(checked);
+	REQUIRE(mc != nullptr);
+	CHECK(mc->mismatch >= 0);
+	CHECK(mc->mismatch <= 1e-14);
+}
+
+TEST_CASE("nonsmooth_newton_contact_basis_repair_and_unsupported_forms", NONSMOOTH_NEWTON_SIM_TAGS)
+{
+	const int steps = 10;
+	SECTION("repair of B")
+	{
+		json args = five_cubes(steps, "NonsmoothNewton", "");
+		args["/solver/nonlinear/NonsmoothNewton/basis_repair/mode"_json_pointer] = "r_ad";
 		args["/solver/nonlinear/NonsmoothNewton/selection"_json_pointer] = "blind";
-		args["/solver/nonlinear/NonsmoothNewton/blind/al_stage"_json_pointer] = "blind";
-		CHECK_THROWS_WITH(run(args), ContainsSubstring("not available yet"));
+		std::shared_ptr<CheckedTransientVarForm> checked;
+		CHECK(run(args, &checked).allFinite());
+		CHECK(!checked->intersecting);
+		args["/solver/nonlinear/NonsmoothNewton/selection"_json_pointer] = "energy_split";
+		CHECK(run(args).allFinite());
 	}
+	SECTION("remainder")
+	{
+		json args = five_cubes(steps, "NonsmoothNewton", "");
+		args["/solver/nonlinear/NonsmoothNewton/selection"_json_pointer] = "blind";
+		args["/solver/nonlinear/NonsmoothNewton/blind/unsupported_forms"_json_pointer] = "remainder";
+		CHECK(run(args).allFinite());
+	}
+}
+
+TEST_CASE("nonsmooth_newton_contact_platform_options", NONSMOOTH_NEWTON_SIM_TAGS)
+{
+	const int steps = 4;
+	const Eigen::MatrixXd base = run(five_cubes(steps, "NonsmoothNewton", ""));
+	SECTION("closed-form kernel")
+	{
+		json args = five_cubes(steps, "NonsmoothNewton", "");
+		args["/solver/advanced/fast_p1_kernel"_json_pointer] = true;
+		const Eigen::MatrixXd fast = run(args);
+		REQUIRE(fast.size() == base.size());
+		CHECK((fast - base).cwiseAbs().maxCoeff() < 1e-8); // the same minimizer, rounded differently
+	}
+	SECTION("initial perturbation")
+	{
+		json args = five_cubes(steps, "NonsmoothNewton", "");
+		args["/solver/advanced/initial_perturbation_seed"_json_pointer] = 7;
+		const Eigen::MatrixXd perturbed = run(args);
+		REQUIRE(perturbed.size() == base.size());
+		CHECK(perturbed != base);
+		CHECK((perturbed - base).cwiseAbs().maxCoeff() < 1e-8);
+		CHECK(run(args) == perturbed); // deterministic in the seed
+	}
+	SECTION("gradient norm accept")
+	{
+		json args = five_cubes(steps, "NonsmoothNewton", "");
+		args["/solver/nonlinear/line_search/RobustArmijo/gradient_norm_accept"_json_pointer] = true;
+		CHECK(run(args).allFinite());
+	}
+}
+
+TEST_CASE("nonsmooth_newton_basis_repair_rounds", "[nonsmooth_newton]")
+{
+	// R_ad on synthetic units: a chain of nodes 0-1-2-3-4-5, the blocks of the units (i, i + 1) are indefinite except one
+	using solver::BasisRepair;
+	using solver::RepairUnit;
+	const int n_nodes = 6;
+	const auto make_units = [&](const Eigen::VectorXd &, std::vector<RepairUnit> &units) {
+		for (int i = 0; i + 1 < n_nodes; ++i)
+		{
+			RepairUnit r;
+			r.n_nodes = 2;
+			r.node = {{i, i + 1, -1, -1}};
+			r.nd = 2;
+			r.dof = {{i, i + 1}};
+			r.H = Eigen::Matrix2d::Zero();
+			r.H(0, 0) = i == 2 ? 1.0 : -1.0; // the unit (2, 3) is positive definite: not repaired
+			r.H(1, 1) = 1.0;
+			r.frozen = i != 4; // the unit (4, 5) is exact: not repaired
+			units.push_back(r);
+		}
+	};
+	BasisRepair repair(make_units, [](const long index) { return int(index); });
+	Eigen::VectorXd x = Eigen::VectorXd::Zero(n_nodes);
+	StiffnessMatrix dB;
+	bool final_round = false;
+	// round 1 fails at node 0: radius 1 around it reaches the unit (0, 1) only
+	REQUIRE(repair.repair({x, 1, 0, 1}, dB, final_round));
+	CHECK(dB.nonZeros() > 0);
+	CHECK(dB.coeff(0, 0) == Catch::Approx(1.0)); // proj(-1) - (-1)
+	CHECK(dB.coeff(1, 1) == Catch::Approx(0.0));
+	CHECK(dB.coeff(2, 2) == Catch::Approx(0.0));
+	// the same node fails again: the radius grows to 2, the unit (1, 2) joins
+	REQUIRE(repair.repair({x, 2, 0, 1}, dB, final_round));
+	CHECK(dB.coeff(1, 1) == Catch::Approx(1.0));
+	// another node fails: the radius starts again at 1 around it (node 5: the unit (4, 5) is exact, nothing new at radius 1)
+	CHECK(!repair.repair({x, 3, 5, 1}, dB, final_round));
+	// no failure position: no repair
+	CHECK(!repair.repair({x, 1, -1, 1}, dB, final_round));
 }
 
 TEST_CASE("nonsmooth_newton_contact_first_layer", NONSMOOTH_NEWTON_SIM_TAGS)
@@ -764,3 +890,114 @@ TEST_CASE("nonsmooth_newton_contact_friction_derivatives", NONSMOOTH_NEWTON_SIM_
 	CHECK(vf->err_block_grad < 1e-10);
 	CHECK(vf->err_block_hess < 1e-10);
 }
+
+TEST_CASE("nonsmooth_newton_contact_blind_friction_and_al", NONSMOOTH_NEWTON_SIM_TAGS)
+{
+	// friction terms join the units of the collision pairs on the same vertices; the augmented Lagrangian subproblems are solved by the
+	// blind selection if blind/al_stage = blind (the penalty terms of the constraints are node units)
+	const int steps = 8;
+	SECTION("friction")
+	{
+		json args = five_cubes_friction(steps, "");
+		args["/solver/nonlinear/NonsmoothNewton/selection"_json_pointer] = "blind";
+		std::shared_ptr<CheckedTransientVarForm> checked;
+		const Eigen::MatrixXd sol = run(args, &checked);
+		REQUIRE(sol.allFinite());
+		CHECK(checked->frames == steps);
+		CHECK(!checked->intersecting);
+	}
+	SECTION("al_stage blind")
+	{
+		json args = five_cubes_pushed(steps, "NonsmoothNewton", "");
+		args["/solver/nonlinear/NonsmoothNewton/selection"_json_pointer] = "blind";
+		args["/solver/nonlinear/NonsmoothNewton/blind/al_stage"_json_pointer] = "blind";
+		std::shared_ptr<CheckedTransientVarForm> checked;
+		const Eigen::MatrixXd sol = run(args, &checked);
+		REQUIRE(sol.allFinite());
+		CHECK(checked->frames == steps);
+		CHECK(!checked->intersecting);
+	}
+	SECTION("friction and al_stage blind")
+	{
+		json args = five_cubes_friction(steps, "");
+		args["/boundary_conditions/obstacle_displacements"_json_pointer] = json::array({json{{"id", 0}, {"value", json::array({0, "2 * t", 0})}}});
+		args["/solver/nonlinear/NonsmoothNewton/selection"_json_pointer] = "blind";
+		args["/solver/nonlinear/NonsmoothNewton/blind/al_stage"_json_pointer] = "blind";
+		CHECK(run(args).allFinite());
+	}
+}
+
+TEST_CASE("nonsmooth_newton_contact_blind_unit_sums", NONSMOOTH_NEWTON_SIM_TAGS)
+{
+	// for any exact set the smooth part (frozen units, their expansion at the anchor) and the exact term add up to the total: gradient and
+	// Hessian at the anchor (consistent mass, friction, collision pairs, elements)
+	class UnitSums : public CheckedTransientVarForm
+	{
+	public:
+		using CheckedTransientVarForm::CheckedTransientVarForm;
+		int step_at = 0;
+		double err_gradient = -1, err_hessian = -1, scale_gradient = 0;
+		long n_exact_elements = 0, n_exact_pairs = 0, n_pairs = 0;
+
+	protected:
+		void solve_tensor_nonlinear(int step, Eigen::MatrixXd &sol, bool init_lagging = true) override
+		{
+			CheckedTransientVarForm::solve_tensor_nonlinear(step, sol, init_lagging);
+			if (step != step_at)
+				return;
+			using Vec = Eigen::VectorXd;
+			solver::NLProblem &nl = *solve_data_.nl_problem;
+			const auto term = std::dynamic_pointer_cast<solver::BlindUnitTerm>(make_nonsmooth_term(args["solver"]["nonlinear"]));
+			REQUIRE(term != nullptr);
+			const auto session = std::dynamic_pointer_cast<solver::BlindSession>(nl.nonsmooth_session());
+			REQUIRE(session != nullptr);
+			const Vec x = nl.full_to_reduced(Vec(sol));
+			for (auto &f : forms)
+				f->set_project_to_psd(false);
+			term->update(x);
+			Vec gs, gn, gt;
+			StiffnessMatrix Hs, Hn, Ht;
+			term->smooth_gradient(x, gs); // takes the anchor
+			// an exact set: every third element and every second contact unit of the anchor
+			solver::UnitCache &cache = session->cache();
+			std::vector<solver::UnitKey> keys;
+			for (int e = 0; e < cache.n_elements(); e += 3)
+				keys.push_back(cache.element_key(e));
+			n_exact_elements = long(keys.size());
+			const auto &coll = cache.cur().coll;
+			n_pairs = coll.size();
+			for (int j = 0; j < coll.size(); j += 2)
+			{
+				keys.push_back(coll.key[j]);
+				++n_exact_pairs;
+			}
+			session->add_keys(keys, false);
+			term->smooth_gradient(x, gs);
+			term->smooth_hessian(x, false, Hs);
+			term->gradient(x, gn);
+			term->hessian(x, false, Hn);
+			nl.gradient(x, gt);
+			nl.hessian(x, Ht);
+			err_gradient = (gs + gn - gt).norm();
+			scale_gradient = gt.norm();
+			err_hessian = StiffnessMatrix(Hs + Hn - Ht).norm() / std::max(Ht.norm(), 1e-300);
+		}
+	};
+	const int steps = 8;
+	json args = five_cubes_friction(steps, "");
+	args["/solver/advanced/lump_mass_matrix"_json_pointer] = false;
+	args["/solver/nonlinear/NonsmoothNewton/selection"_json_pointer] = "blind";
+	std::shared_ptr<CheckedTransientVarForm> checked;
+	run(args, &checked, [steps](const io::ResourceIO &r) {
+		auto f = std::make_shared<UnitSums>(r);
+		f->step_at = steps;
+		return f;
+	});
+	const auto us = std::dynamic_pointer_cast<UnitSums>(checked);
+	REQUIRE(us != nullptr);
+	CHECK(us->n_pairs > 0);
+	CHECK(us->n_exact_elements > 0);
+	CHECK(us->err_gradient <= 1e-9 * std::max(us->scale_gradient, 1.0));
+	CHECK(us->err_hessian <= 1e-9);
+}
+

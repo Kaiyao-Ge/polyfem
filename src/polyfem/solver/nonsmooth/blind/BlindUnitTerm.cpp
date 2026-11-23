@@ -5,12 +5,15 @@
 #include <polyfem/solver/NLProblem.hpp>
 #include <polyfem/solver/forms/BarrierContactForm.hpp>
 #include <polyfem/solver/forms/ElasticForm.hpp>
+#include <polyfem/solver/forms/FrictionForm.hpp>
+#include <polyfem/solver/forms/InertiaForm.hpp>
 #include <polyfem/utils/Logger.hpp>
 #include <polyfem/utils/MaybeParallelFor.hpp>
 
 #include <ipc/candidates/candidates.hpp>
 #include <ipc/collision_mesh.hpp>
 #include <ipc/potentials/barrier_potential.hpp>
+#include <ipc/potentials/friction_potential.hpp>
 #include <ipc/utils/eigen_ext.hpp>
 
 #include <algorithm>
@@ -43,18 +46,26 @@ namespace polyfem::solver
 								 const Eigen::SparseMatrix<double> *displacement_map,
 								 const std::shared_ptr<const FastTetValidity> &fast_validity,
 								 const Options &opts,
-								 const std::shared_ptr<BlindSession> &session)
+								 const std::shared_ptr<BlindSession> &session,
+								 const std::shared_ptr<const LocalMass> &mass,
+								 const bool full_size)
 		: BarrierContactNonsmoothTerm(problem, forms, mass_full, collision_mesh, displacement_map, fast_validity, [&] {
 			  Options o = opts;
 			  o.first_layer = false; // the first layer of the blind selection is the one below
 			  return o;
 		  }()),
-		  session_(session), port_(*this), sink_(*this)
+		  full_size_(full_size), session_(session), port_(*this), sink_(*this)
 	{
-		if (problem_.uses_full_size())
-			log_and_throw_error("NonsmoothNewton: selection = blind in the augmented Lagrangian subproblems (blind/al_stage = blind) is not available yet");
-		if (friction_)
-			log_and_throw_error("NonsmoothNewton: selection = blind does not support friction yet; use selection = energy_split");
+		if (full_size_)
+		{
+			// the augmented Lagrangian subproblems: the unknowns are all full dofs (no reduction); the collision vertices (obstacle
+			// included) map to full dofs through the same node map
+			const int nf = problem_.full_size();
+			red_of_full_.resize(nf);
+			for (int i = 0; i < nf; ++i)
+				red_of_full_[i] = i;
+			local_ok_ = opts_.local_blocks && init_node_of_vertex(nf);
+		}
 		if (!local_ok_)
 			log_and_throw_error("NonsmoothNewton: selection = blind needs the local contact blocks (plain selection dof map, one FE node per collision vertex, debug/local_blocks)");
 		for (const auto &f : other_)
@@ -66,9 +77,32 @@ namespace polyfem::solver
 			}
 		if (!elastic_ || !elastic_->supports_local())
 			log_and_throw_error("NonsmoothNewton: selection = blind needs an elastic form with local element derivatives");
-		const Vec x0 = problem_.reduced_to_full(Vec::Zero(problem_.reduced_size()));
-		node_local_ = BlindForms::classify(other_, elastic_, contact_, std::shared_ptr<Form>(), x0, 3).node_local;
+		const Vec x0 = full_size_ ? Vec(Vec::Zero(problem_.full_size())) : problem_.reduced_to_full(Vec::Zero(problem_.reduced_size()));
+		// the inertia with a consistent mass couples the nodes of an element: its element blocks are terms of the element units
+		for (const auto &f : other_)
+			if (auto in = std::dynamic_pointer_cast<InertiaForm>(f); in && in->enabled() && !is_node_block_diagonal(in->mass(), 3))
+				inertia_ = in;
+		std::vector<std::shared_ptr<Form>> skip;
+		if (inertia_)
+		{
+			if (!mass || mass->n != int(elastic_->n_elements()))
+				log_and_throw_error("NonsmoothNewton: selection = blind with the consistent mass needs the element blocks of the mass matrix");
+			if (const double e = mass->mismatch(inertia_->mass(), 3); !(e <= 1e-14))
+				log_and_throw_error("NonsmoothNewton: the element blocks of the mass matrix do not add up to the mass matrix of the inertia form (relative difference {:g})", e);
+			mass_ = mass;
+			skip.push_back(inertia_);
+		}
+		node_local_ = BlindForms::classify(other_, elastic_, contact_, std::shared_ptr<Form>(), x0, 3, skip, session_->params().unsupported_remainder).node_local;
+		if (full_size_)
+		{
+			// the penalty terms of the constraints are node terms if their Hessian couples only the dofs of one node
+			StiffnessMatrix Hp(x0.size(), x0.size());
+			problem_.add_penalty_hessian(x0, Hp);
+			if (!is_node_block_diagonal(Hp, 3) && !session_->params().unsupported_remainder)
+				log_and_throw_error("NonsmoothNewton: selection = blind cannot split the augmented Lagrangian penalty of the constraints into units (a constraint couples several nodes); blind/unsupported_forms = remainder keeps it in the frozen part");
+		}
 		UnitCache &cache = session_->cache();
+		cache.set_mass(mass_);
 		cache.bind(elastic_, 3, x0);
 		if (!cache.on())
 			log_and_throw_error("NonsmoothNewton: selection = blind needs P1 tetrahedra with unit dof weights and an elastic form with local derivatives");
@@ -183,6 +217,90 @@ namespace polyfem::solver
 		cd.index.reserve(nc * 2);
 		for (size_t i = 0; i < nc; ++i)
 			cd.index.emplace(cd.key[i], int(i)); // the first pair of a node set represents it
+		if (friction_)
+			add_friction_terms(cd, xfull);
+	}
+
+	UnitKey BlindUnitTerm::tangent_key(const ipc::TangentialCollisions &fcs, const size_t i) const
+	{
+		const auto vis = fcs[i].vertex_ids(mesh_.edges(), mesh_.faces());
+		const int nv = fcs[i].num_vertices();
+		int nodes[4];
+		for (int a = 0; a < nv; ++a)
+			nodes[a] = vis[a] >= 0 ? node_of_vertex_[vis[a]] : -1;
+		return make_unit_key(nodes, nv);
+	}
+
+	/// The friction terms of the lagged pairs at xfull join the entries of the same nodes (the same stencil as the collision pair they come from,
+	/// so the same local dofs); a pair without a collision pair is an entry of its own.
+	void BlindUnitTerm::add_friction_terms(CollData &cd, const Vec &xfull)
+	{
+		const auto &fcs = friction_->friction_collision_set();
+		const size_t nf = fcs.size();
+		cd.Hf.assign(cd.key.size() * NL * NL, 0.0);
+		if (nf == 0)
+			return;
+		const auto &E = mesh_.edges();
+		const auto &Fc = mesh_.faces();
+		const Eigen::MatrixXd Vv = friction_->compute_surface_velocities(xfull);
+		const auto &fp = friction_->friction_potential();
+		const double cf = friction_->derivative_factor(), dvdx = friction_->dv_dx();
+		struct Term
+		{
+			UnitKey key;
+			int nd = 0;
+			std::array<int, NL> dof;
+			double g[NL];
+			Eigen::MatrixXd H;
+			double e = 0;
+		};
+		std::vector<Term> terms(nf);
+		utils::maybe_parallel_for(int(nf), [&](int start, int end, int /*thread_id*/) {
+			for (size_t i = start; i < size_t(end); ++i)
+			{
+				const auto &col = fcs[i];
+				const ipc::VectorMax12d vc = col.dof(Vv, E, Fc);
+				Term &t = terms[i];
+				t.nd = int(vc.size());
+				t.key = tangent_key(fcs, i);
+				const auto vis = col.vertex_ids(E, Fc);
+				t.dof.fill(-1);
+				for (int a = 0; a < col.num_vertices(); ++a)
+					for (int d = 0; d < 3; ++d)
+						t.dof[3 * a + d] = vis[a] >= 0 ? 3 * node_of_vertex_[vis[a]] + d : -1;
+				const ipc::VectorMax12d g = cf * fp.gradient(col, vc);
+				for (int j = 0; j < t.nd; ++j)
+					t.g[j] = g[j];
+				t.H = (cf * dvdx) * fp.hessian(col, vc, ipc::PSDProjectionMethod::NONE);
+				t.e = cf * fp(col, vc) / dvdx;
+			}
+		});
+		const size_t nb = cd.key.size();
+		for (size_t i = 0; i < nf; ++i)
+		{
+			const Term &t = terms[i];
+			int entry = -1;
+			if (const int j = cd.find(t.key); j >= 0 && j < int(nb) && cd.nd[j] == t.nd && std::equal(t.dof.begin(), t.dof.begin() + t.nd, cd.dof.begin() + std::size_t(j) * NL))
+				entry = j;
+			if (entry < 0)
+			{
+				entry = int(cd.key.size());
+				cd.key.push_back(t.key);
+				cd.nd.push_back((signed char)t.nd);
+				cd.dof.resize(cd.dof.size() + NL, -1);
+				std::copy(t.dof.begin(), t.dof.end(), cd.dof.begin() + std::size_t(entry) * NL);
+				cd.g.resize(cd.g.size() + NL, 0.0);
+				cd.H.resize(cd.H.size() + NL * NL, 0.0);
+				cd.Hf.resize(cd.Hf.size() + NL * NL, 0.0);
+				cd.e.push_back(0.0);
+				cd.index.emplace(t.key, entry);
+			}
+			for (int j = 0; j < t.nd; ++j)
+				cd.g[std::size_t(entry) * NL + j] += t.g[j];
+			Eigen::Map<Eigen::MatrixXd>(cd.H.data() + std::size_t(entry) * NL * NL, t.nd, t.nd) += t.H;
+			Eigen::Map<Eigen::MatrixXd>(cd.Hf.data() + std::size_t(entry) * NL * NL, t.nd, t.nd) += t.H;
+			cd.e[entry] += t.e;
+		}
 	}
 
 	UnitCache::Anchor &BlindUnitTerm::blind_capture(const Vec &xfull)
@@ -196,10 +314,61 @@ namespace polyfem::solver
 		{
 			fill_collisions(A.coll, xfull);
 			fill_node_data(node_local_, xfull, 3, A.node);
+			if (full_size_)
+				add_penalty_to_nodes(xfull, A.node);
+			if (inertia_)
+				fill_inertia(xfull, A);
 			A.u_ok = true;
 			A.gen = session_->generation();
 		}
 		return A;
+	}
+
+	void BlindUnitTerm::add_penalty_to_nodes(const Vec &xf, NodeData &node) const
+	{
+		Vec g = Vec::Zero(xf.size());
+		problem_.add_penalty_gradient(xf, g);
+		StiffnessMatrix H(xf.size(), xf.size());
+		problem_.add_penalty_hessian(xf, H);
+		for (Eigen::Index r = 0; r < g.size(); ++r)
+			node.g[std::size_t(r / 3) * 3 + r % 3] += g[r];
+		for (int c = 0; c < H.outerSize(); ++c)
+			for (StiffnessMatrix::InnerIterator it(H, c); it; ++it)
+				if (it.row() / 3 == it.col() / 3)
+					node.H[std::size_t(it.col() / 3) * 9 + (it.row() % 3) + 3 * (it.col() % 3)] += it.value();
+	}
+
+	/// PSD projection of the Hessian block of entry j: the barrier part is projected, the friction part is not
+	Eigen::MatrixXd BlindUnitTerm::project_barrier_part(const CollData &cd, const int j, const Eigen::MatrixXd &H)
+	{
+		if (cd.Hf.empty())
+			return ipc::project_to_psd(H);
+		const int nd = int(H.rows());
+		const Eigen::Map<const Eigen::MatrixXd> Hf(cd.Hf.data() + std::size_t(j) * NL * NL, nd, nd);
+		return Eigen::MatrixXd(ipc::project_to_psd(Eigen::MatrixXd(H - Hf)) + Hf);
+	}
+
+	void BlindUnitTerm::friction_exact_list(std::vector<int> &idx) const
+	{
+		idx.clear();
+		if (!friction_)
+			return;
+		const auto &fcs = friction_->friction_collision_set();
+		for (size_t i = 0; i < fcs.size(); ++i)
+			if (session_->in_S(tangent_key(fcs, i)))
+				idx.push_back(int(i));
+	}
+
+	void BlindUnitTerm::fill_inertia(const Vec &xf, UnitCache::Anchor &A) const
+	{
+		const double w = inertia_->weight() / inertia_->scale();
+		const Vec xt = inertia_->x_tilde();
+		A.wm = w;
+		A.ig.assign(std::size_t(mass_->n) * NL, 0.0);
+		utils::maybe_parallel_for(mass_->n, [&](int start, int end, int /*thread_id*/) {
+			for (int e = start; e < end; ++e)
+				mass_->gradient(e, w, xf, xt, A.ig.data() + std::size_t(e) * NL);
+		});
 	}
 
 	// ---------------------------------------------------------------------------------------------------- smooth part
@@ -247,6 +416,14 @@ namespace polyfem::solver
 			else
 				elastic_->subset_gradient(xfull, ids, gs);
 			gn -= gs;
+			if (inertia_)
+			{
+				// and their inertia terms
+				const auto &A = cache.cur();
+				for (const int e : ids)
+					for (int j = 0; j < NL; ++j)
+						gn[mass_->dof(e, j / 3, j % 3)] -= A.ig[std::size_t(e) * NL + j];
+			}
 		}
 		{
 			// the collision pairs of the anchor that are not exact: their gradient at the anchor
@@ -315,6 +492,24 @@ namespace polyfem::solver
 			else
 				elastic_->subset_hessian(xfull, ids, project_to_psd, hs);
 			h -= hs;
+			if (inertia_)
+			{
+				std::vector<Eigen::Triplet<double>> trip;
+				trip.reserve(ids.size() * 144);
+				const double wm = inertia_->weight() / inertia_->scale();
+				for (const int e : ids)
+				{
+					double Hm[144] = {0};
+					mass_->add_hessian(e, wm, Hm);
+					for (int i = 0; i < NL; ++i)
+						for (int j = 0; j < NL; ++j)
+							if (Hm[i + NL * j] != 0)
+								trip.emplace_back(mass_->dof(e, i / 3, i % 3), mass_->dof(e, j / 3, j % 3), Hm[i + NL * j]);
+				}
+				StiffnessMatrix hm(xfull.size(), xfull.size());
+				hm.setFromTriplets(trip.begin(), trip.end());
+				h -= hm;
+			}
 		}
 		{
 			const CollData &cd = cache.cur().coll;
@@ -327,7 +522,7 @@ namespace polyfem::solver
 				const int nd = cd.nd[j];
 				Eigen::MatrixXd Hc = Eigen::Map<const Eigen::MatrixXd>(cd.H.data() + std::size_t(j) * NL * NL, nd, nd);
 				if (project_to_psd)
-					Hc = ipc::project_to_psd(Hc);
+					Hc = project_barrier_part(cd, j, Hc);
 				for (int a = 0; a < nd; ++a)
 				{
 					const int da = cd.dof[std::size_t(j) * NL + a];
@@ -354,7 +549,16 @@ namespace polyfem::solver
 		double elastic = 0;
 		const std::vector<int> &ids = exact_elements();
 		if (!ids.empty())
+		{
 			elastic = elastic_->subset_energy(yf, ids);
+			if (inertia_)
+			{
+				const double wm = inertia_->weight() / inertia_->scale();
+				const Vec xt = inertia_->x_tilde();
+				for (const int e : ids)
+					elastic += mass_->energy(e, wm, yf, xt);
+			}
+		}
 		const auto V = contact_->compute_displaced_surface(yf);
 		const auto &cs = contact_->collision_set();
 		const auto &bp = contact_->barrier_potential();
@@ -366,7 +570,21 @@ namespace polyfem::solver
 		double s = 0;
 		for (const int i : idx)
 			s += bp(cs[i], cs[i].dof(V, E, Fc));
-		return w * s + elastic;
+		double friction = 0;
+		if (friction_)
+		{
+			// the lagged friction pairs of the exact units, at the velocities of yf
+			std::vector<int> fidx;
+			friction_exact_list(fidx);
+			const auto &fcs = friction_->friction_collision_set();
+			const Eigen::MatrixXd Vv = friction_->compute_surface_velocities(yf);
+			const auto &fp = friction_->friction_potential();
+			double sf = 0;
+			for (const int i : fidx)
+				sf += fp(fcs[i], fcs[i].dof(Vv, E, Fc));
+			friction = friction_->derivative_factor() * sf / friction_->dv_dx();
+		}
+		return w * s + elastic + friction;
 	}
 
 	void BlindUnitTerm::gradient(const Vec &y, Vec &grad)
@@ -392,12 +610,43 @@ namespace polyfem::solver
 					if (vis[a] >= 0)
 						g[3 * node_of_vertex_[vis[a]] + d] += gc[3 * a + d];
 		}
+		if (friction_)
+		{
+			std::vector<int> fidx;
+			friction_exact_list(fidx);
+			const auto &fcs = friction_->friction_collision_set();
+			const Eigen::MatrixXd Vv = friction_->compute_surface_velocities(yf);
+			const auto &fp = friction_->friction_potential();
+			const double cf = friction_->derivative_factor();
+			for (const int i : fidx)
+			{
+				const auto &col = fcs[i];
+				const ipc::VectorMax12d gc = cf * fp.gradient(col, col.dof(Vv, E, Fc));
+				const auto vis = col.vertex_ids(E, Fc);
+				for (int a = 0; a < col.num_vertices(); ++a)
+					for (int d = 0; d < 3; ++d)
+						if (vis[a] >= 0)
+							g[3 * node_of_vertex_[vis[a]] + d] += gc[3 * a + d];
+			}
+		}
 		const std::vector<int> &ids = exact_elements();
 		if (!ids.empty())
 		{
 			Vec ge;
 			elastic_->subset_gradient(yf, ids, ge);
 			g += ge;
+			if (inertia_)
+			{
+				const double wm = inertia_->weight() / inertia_->scale();
+				const Vec xt = inertia_->x_tilde();
+				double gl[NL];
+				for (const int e : ids)
+				{
+					mass_->gradient(e, wm, yf, xt, gl);
+					for (int j = 0; j < NL; ++j)
+						g[mass_->dof(e, j / 3, j % 3)] += gl[j];
+				}
+			}
 		}
 		grad = to_reduced(g);
 	}
@@ -432,6 +681,30 @@ namespace polyfem::solver
 							if (vis[a] >= 0 && vis[b] >= 0)
 								trip.emplace_back(3 * node_of_vertex_[vis[a]] + da, 3 * node_of_vertex_[vis[b]] + db, Hc(3 * a + da, 3 * b + db));
 		}
+		// the friction of the exact units: not projected; B of the first solve of a time step takes it at the velocities of the previous step
+		const bool at_lag = friction_ && project_to_psd && problem_.take_friction_b_lag();
+		if (friction_)
+		{
+			std::vector<int> fidx;
+			friction_exact_list(fidx);
+			const auto &fcs = friction_->friction_collision_set();
+			const Eigen::MatrixXd Vv = at_lag ? friction_->previous_surface_velocities() : friction_->compute_surface_velocities(yf);
+			const auto &fp = friction_->friction_potential();
+			const double cfd = friction_->derivative_factor() * friction_->dv_dx();
+			for (const int i : fidx)
+			{
+				const auto &col = fcs[i];
+				const Eigen::MatrixXd Hc = cfd * fp.hessian(col, col.dof(Vv, E, Fc), ipc::PSDProjectionMethod::NONE);
+				const auto vis = col.vertex_ids(E, Fc);
+				const int nv = col.num_vertices();
+				for (int a = 0; a < nv; ++a)
+					for (int da = 0; da < 3; ++da)
+						for (int b = 0; b < nv; ++b)
+							for (int db = 0; db < 3; ++db)
+								if (vis[a] >= 0 && vis[b] >= 0)
+									trip.emplace_back(3 * node_of_vertex_[vis[a]] + da, 3 * node_of_vertex_[vis[b]] + db, Hc(3 * a + da, 3 * b + db));
+			}
+		}
 		K.resize(yf.size(), yf.size());
 		K.setFromTriplets(trip.begin(), trip.end());
 		const std::vector<int> &ids = exact_elements();
@@ -440,6 +713,24 @@ namespace polyfem::solver
 			StiffnessMatrix Ke;
 			elastic_->subset_hessian(yf, ids, project_to_psd, Ke);
 			K += Ke;
+			if (inertia_)
+			{
+				// the inertia terms are not projected (positive semidefinite)
+				std::vector<Eigen::Triplet<double>> trip;
+				const double wm = inertia_->weight() / inertia_->scale();
+				for (const int e : ids)
+				{
+					double Hm[144] = {0};
+					mass_->add_hessian(e, wm, Hm);
+					for (int i = 0; i < NL; ++i)
+						for (int j = 0; j < NL; ++j)
+							if (Hm[i + NL * j] != 0)
+								trip.emplace_back(mass_->dof(e, i / 3, i % 3), mass_->dof(e, j / 3, j % 3), Hm[i + NL * j]);
+				}
+				StiffnessMatrix Km(yf.size(), yf.size());
+				Km.setFromTriplets(trip.begin(), trip.end());
+				K += Km;
+			}
 		}
 		to_reduced(K);
 		hessian = std::move(K);
@@ -447,8 +738,8 @@ namespace polyfem::solver
 
 	bool BlindUnitTerm::hessian_blocks(const Vec &y, Vec &grad, std::vector<polysolve::nonlinear::HessianBlock> &blocks)
 	{
-		if (!(opts_.local_blocks && local_ok_) || problem_.uses_full_size())
-			return false; // the local blocks map to the reduced dofs
+		if (!(opts_.local_blocks && local_ok_) || problem_.uses_full_size() != full_size_)
+			return false; // the local blocks map to the dofs of the size of the term
 		const Vec yf = problem_.reduced_to_full(y);
 		const auto V = contact_->compute_displaced_surface(yf);
 		const auto &cs = contact_->collision_set();
@@ -459,11 +750,13 @@ namespace polyfem::solver
 		grad = Vec::Zero(y.size());
 		std::vector<int> bidx; // the collisions of the state that are exact
 		blind_exact_list(cs, bidx);
+		std::vector<int> fidx; // the lagged friction pairs of the exact units
+		friction_exact_list(fidx);
 		const std::vector<int> &ids = exact_elements();
-		const size_t nb = bidx.size(), ne = ids.size();
+		const size_t nb = bidx.size(), nf = fidx.size(), ne = ids.size();
 		blocks.clear();
-		blocks.resize(nb + ne);
-		std::vector<ipc::VectorMax12d> gb(nb + ne);
+		blocks.resize(nb + nf + ne);
+		std::vector<ipc::VectorMax12d> gb(nb + nf + ne);
 		const auto set_indices = [&](const auto &vids, polysolve::nonlinear::HessianBlock &b) {
 			for (int a = 0; a < b.size / 3; ++a)
 				for (int d = 0; d < 3; ++d)
@@ -481,9 +774,32 @@ namespace polyfem::solver
 				set_indices(col.vertex_ids(E, Fc), b);
 			}
 		});
+		if (nf > 0)
+		{
+			// one block per friction pair, at the surface velocities of y (unprojected; gradient wrt x = weighted gradient wrt v, Hessian wrt x = dv/dx times
+			// the weighted Hessian wrt v)
+			const auto &fcs = friction_->friction_collision_set();
+			const Eigen::MatrixXd Vv = friction_->compute_surface_velocities(yf);
+			const auto &fp = friction_->friction_potential();
+			const double cf = friction_->derivative_factor(), dvdx = friction_->dv_dx();
+			utils::maybe_parallel_for(int(nf), [&](int start, int end, int /*thread_id*/) {
+				for (size_t i = start; i < size_t(end); ++i)
+				{
+					const auto &col = fcs[size_t(fidx[i])];
+					const ipc::VectorMax12d vc = col.dof(Vv, E, Fc);
+					polysolve::nonlinear::HessianBlock &b = blocks[nb + i];
+					b.size = int(vc.size());
+					gb[nb + i] = cf * fp.gradient(col, vc);
+					b.H.topLeftCorner(b.size, b.size) = (cf * dvdx) * fp.hessian(col, vc, ipc::PSDProjectionMethod::NONE);
+					set_indices(col.vertex_ids(E, Fc), b);
+				}
+			});
+		}
 		if (ne > 0)
 		{
 			const Eigen::MatrixXd ym = yf;
+			const double wm_blocks = inertia_ ? inertia_->weight() / inertia_->scale() : 0.0;
+			const Vec xt_blocks = inertia_ ? inertia_->x_tilde() : Vec();
 			struct TD
 			{
 				assembler::ElementAssemblyValues vals;
@@ -495,12 +811,21 @@ namespace polyfem::solver
 				for (int k = start; k < end; ++k)
 				{
 					elastic_->element_local(ym, ids[k], true, false, td.vals, td.loc);
+					if (inertia_)
+					{
+						// the element's inertia terms join its block (the Hessian block is the raw sum; B projects the elastic part only)
+						double gl[NL];
+						mass_->gradient(ids[k], wm_blocks, yf, xt_blocks, gl);
+						for (int j = 0; j < NL; ++j)
+							td.loc.g[j] += gl[j];
+						mass_->add_hessian(ids[k], wm_blocks, td.loc.H.data());
+					}
 					const int n = int(td.loc.g.size());
 					if (n != NL)
 						throw std::runtime_error("NonsmoothNewton: an exact element with more than 12 local dofs");
-					polysolve::nonlinear::HessianBlock &b = blocks[nb + k];
+					polysolve::nonlinear::HessianBlock &b = blocks[nb + nf + k];
 					b.size = n;
-					gb[nb + k] = td.loc.g;
+					gb[nb + nf + k] = td.loc.g;
 					b.H.topLeftCorner(n, n) = td.loc.H;
 					for (int j = 0; j < n; ++j)
 					{
@@ -592,15 +917,23 @@ namespace polyfem::solver
 				{
 					std::fill(cd.g.begin() + std::size_t(j) * NL, cd.g.begin() + std::size_t(j + 1) * NL, 0.0);
 					std::fill(cd.H.begin() + std::size_t(j) * NL * NL, cd.H.begin() + std::size_t(j + 1) * NL * NL, 0.0);
+					if (!cd.Hf.empty())
+						std::fill(cd.Hf.begin() + std::size_t(j) * NL * NL, cd.Hf.begin() + std::size_t(j + 1) * NL * NL, 0.0);
 					cd.e[j] = 0;
 					continue;
 				}
 				std::copy(tmp.g.begin() + std::size_t(i) * NL, tmp.g.begin() + std::size_t(i + 1) * NL, cd.g.begin() + std::size_t(j) * NL);
 				std::copy(tmp.H.begin() + std::size_t(i) * NL * NL, tmp.H.begin() + std::size_t(i + 1) * NL * NL, cd.H.begin() + std::size_t(j) * NL * NL);
+				if (!cd.Hf.empty() && tmp.Hf.size() == tmp.H.size())
+					std::copy(tmp.Hf.begin() + std::size_t(i) * NL * NL, tmp.Hf.begin() + std::size_t(i + 1) * NL * NL, cd.Hf.begin() + std::size_t(j) * NL * NL);
 				cd.e[j] = tmp.e[i];
 			}
 		}
 		fill_node_data(node_local_, x0, 3, out.node);
+		if (full_size_)
+			add_penalty_to_nodes(x0, out.node);
+		if (inertia_)
+			fill_inertia(x0, out);
 		out.u_ok = true;
 		out.gen = session_->generation();
 		return true;
@@ -690,7 +1023,7 @@ namespace polyfem::solver
 			const int nd = cd.nd[j];
 			Eigen::MatrixXd Hc = Eigen::Map<const Eigen::MatrixXd>(cd.H.data() + std::size_t(j) * NL * NL, nd, nd);
 			if (projected)
-				Hc = ipc::project_to_psd(Hc);
+				Hc = project_barrier_part(cd, j, Hc);
 			for (int a = 0; a < nd; ++a)
 			{
 				const int da = cd.dof[std::size_t(j) * NL + a];
@@ -771,6 +1104,54 @@ namespace polyfem::solver
 			return 0; // already exact, or born: the limit stands
 		session_->add_keys({k}, true);
 		return 1;
+	}
+
+	// ----------------------------------------------------------------------------------------------- repair of B
+	void BlindUnitTerm::blind_repair_units(const Vec &x, std::vector<RepairUnit> &units)
+	{
+		UnitCache &cache = session_->cache();
+		const Vec xf = problem_.reduced_to_full(x);
+		const UnitCache::Anchor &A = cache.cur();
+		if (!(A.u_ok && A.xf.size() == xf.size() && A.xf == xf))
+			return;
+		for (int e = 0; e < cache.n_elements(); ++e)
+		{
+			RepairUnit r;
+			r.nd = NL;
+			const UnitKey &k = cache.element_key(e);
+			r.n_nodes = k.size();
+			std::copy(k.node.begin(), k.node.end(), r.node.begin());
+			for (int j = 0; j < NL; ++j)
+				r.dof[j] = red_of_full_[cache.dofs(e)[j]];
+			r.H = Eigen::Map<const Eigen::Matrix<double, NL, NL>>(A.H.data() + std::size_t(e) * NL * NL) * A.f;
+			r.frozen = !session_->in_S(k);
+			units.push_back(std::move(r));
+		}
+		const CollData &cd = A.coll;
+		for (int j = 0; j < cd.size(); ++j)
+		{
+			RepairUnit r;
+			r.nd = cd.nd[j];
+			const UnitKey &k = cd.key[j];
+			r.n_nodes = k.size();
+			std::copy(k.node.begin(), k.node.end(), r.node.begin());
+			for (int a = 0; a < r.nd; ++a)
+				r.dof[a] = cd.dof[std::size_t(j) * NL + a] >= 0 ? red_of_full_[cd.dof[std::size_t(j) * NL + a]] : -1;
+			r.H = Eigen::Map<const Eigen::MatrixXd>(cd.H.data() + std::size_t(j) * NL * NL, r.nd, r.nd);
+			if (!cd.Hf.empty())
+				r.H -= Eigen::Map<const Eigen::MatrixXd>(cd.Hf.data() + std::size_t(j) * NL * NL, r.nd, r.nd); // the friction part is not projected
+			r.frozen = !session_->in_S(k);
+			units.push_back(std::move(r));
+		}
+	}
+
+	polysolve::nonlinear::BasisPort *BlindUnitTerm::basis()
+	{
+		if (!repair_port_)
+			repair_port_ = std::make_unique<BasisRepair>(
+				[this](const Vec &x, std::vector<RepairUnit> &units) { blind_repair_units(x, units); },
+				[this](const long index) { return node_of_unknown(index); });
+		return repair_port_.get();
 	}
 
 	// ------------------------------------------------------------------------------------------------------- the ports

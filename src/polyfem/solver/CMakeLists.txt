@@ -16,10 +16,14 @@ set(SOURCES
 	NLHomoProblem.hpp
 	OperatorSplittingSolver.hpp
 	OperatorSplittingSolver.cpp
+	nonsmooth/BasisRepair.hpp
+	nonsmooth/BasisRepair.cpp
 	nonsmooth/FirstLayer.hpp
 	nonsmooth/FirstLayer.cpp
 	nonsmooth/blind/LocalTerms.hpp
 	nonsmooth/blind/LocalTerms.cpp
+	nonsmooth/blind/LocalMass.hpp
+	nonsmooth/blind/LocalMass.cpp
 	nonsmooth/blind/UnitCache.hpp
 	nonsmooth/blind/UnitCache.cpp
 	nonsmooth/blind/BlindSession.hpp

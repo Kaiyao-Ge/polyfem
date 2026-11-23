@@ -143,10 +143,30 @@ namespace polyfem::solver
 					pl[j] = d >= 0 ? pf[d] : 0.0;
 					g0[j] = T0.g[u][j] * T0.w[u];
 					g1[j] = c >= 0 ? T1.g[c][j] * T1.w[c] : 0.0;
+					// the consistent-mass inertia terms of the element
+					if (T0.xg[u] != nullptr)
+						g0[j] += T0.xg[u][j];
+					if (c >= 0 && T1.xg[c] != nullptr)
+						g1[j] += T1.xg[c][j];
 				}
 				Eigen::MatrixXd H = Eigen::Map<const Eigen::MatrixXd>(T0.H[u], nd, nd) * T0.w[u];
 				if (prev_projected)
+				{
+					// the barrier part is projected, the friction part is not
+					if (T0.Hf[u] != nullptr)
+						H -= Eigen::Map<const Eigen::MatrixXd>(T0.Hf[u], nd, nd);
 					H = ipc::project_to_psd(H);
+					if (T0.Hf[u] != nullptr)
+						H += Eigen::Map<const Eigen::MatrixXd>(T0.Hf[u], nd, nd);
+				}
+				if (T0.xm[u] != nullptr)
+				{
+					const auto tri = [](const int i, const int jj) { return i >= jj ? i * (i + 1) / 2 + jj : jj * (jj + 1) / 2 + i; };
+					for (int i = 0; i < 4; ++i)
+						for (int jj = 0; jj < 4; ++jj)
+							for (int k = 0; k < 3; ++k)
+								H(3 * i + k, 3 * jj + k) += T0.xw[u] * T0.xm[u][tri(i, jj)];
+				}
 				const Eigen::VectorXd Hp = H * pl.head(nd);
 				for (int j = 0; j < nd; ++j)
 				{
@@ -176,7 +196,7 @@ namespace polyfem::solver
 
 		const Vec zero_full = P_.reduced_to_full(Vec::Zero(x.size()));
 		const auto back = [&](const Vec &cfull, Vec &ufull, double &q) {
-			const Vec cr = P_.full_to_reduced_grad(cfull);
+			const Vec cr = P_.uses_full_size() ? cfull : P_.full_to_reduced_grad(cfull);
 			Vec ur;
 			if (!ctx.solve(cr, ur))
 				throw std::runtime_error("UnitSelector: back-solve not available");

@@ -32,6 +32,11 @@ namespace polyfem::solver
 
 		void update_quantities(const double t, const Eigen::VectorXd &x) override;
 
+		/// @brief The mass matrix of the form
+		const StiffnessMatrix &mass() const { return mass_; }
+		/// @brief The target of the time integrator: the form is 1/2 (x - x_tilde)^T M (x - x_tilde) times weight / scale
+		Eigen::VectorXd x_tilde() const;
+
 	protected:
 		/// @brief Compute the value of the form
 		/// @param x Current solution
@@ -49,8 +54,6 @@ namespace polyfem::solver
 		void second_derivative_unweighted(const Eigen::VectorXd &x, StiffnessMatrix &hessian) const override;
 
 	private:
-		Eigen::VectorXd x_tilde() const;
-
 		// TODO mass might be time dependent
 		const StiffnessMatrix &mass_;                                    ///< Mass matrix
 		const time_integrator::ImplicitTimeIntegrator &time_integrator_; ///< Time integrator

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "LocalMass.hpp"
 #include "LocalTerms.hpp"
 
 #include <polyfem/assembler/LocalCapture.hpp>
@@ -24,6 +25,13 @@ namespace polyfem::solver
 		std::vector<const double *> g;
 		std::vector<const double *> H;
 		std::vector<double> w;
+		// the consistent-mass inertia terms of the element units (null: the unit has none): weighted gradient (12) and the scalar block
+		// (10 numbers, LocalMass layout) with its weight; the Hessian is xw (m (x) I_3)
+		std::vector<const double *> xg;
+		std::vector<const double *> xm;
+		std::vector<double> xw;
+		// the friction part of the Hessian of a contact unit (not projected; null: none)
+		std::vector<const double *> Hf;
 	};
 
 	/// @brief The local gradient and Hessian of every unit at the current and at the previous anchor (the point the model of an outer
@@ -44,11 +52,17 @@ namespace polyfem::solver
 			Vec xf;                          ///< full point
 			std::vector<double> g;           ///< nel * 12, unweighted
 			std::vector<double> H;           ///< nel * 144, unweighted, unprojected, column-major
+			std::vector<double> ig;          ///< consistent mass: nel * 12, the weighted local gradient of the inertia (empty: none)
+			double wm = 0;                   ///< consistent mass: the weight / scale of the inertia form the terms were made with
 			bool u_ok = false;               ///< the barrier and node terms of xf are in coll / node
 			long gen = -1;                   ///< the generation they were made in
 			CollData coll;
 			NodeData node;
 		};
+
+		/// @brief The element blocks of the consistent mass (null: the inertia is lumped or absent)
+		void set_mass(const std::shared_ptr<const LocalMass> &mass) { mass_ = mass; }
+		const LocalMass *mass() const { return mass_.get(); }
 
 		/// @brief Tells the cache the elastic form (once per solve): sizes the tables; the cache is off for anything but P1 tetrahedra with unit dof weights
 		void bind(const std::shared_ptr<ElasticForm> &elastic, const int dim, const Vec &xfull0);
@@ -83,5 +97,6 @@ namespace polyfem::solver
 		std::vector<int> dofs_;       ///< nel * 12 full dofs of the local dofs
 		std::vector<UnitKey> ekey_;   ///< nodes of every element
 		assembler::LocalCapture cap_;
+		std::shared_ptr<const LocalMass> mass_;
 	};
 } // namespace polyfem::solver

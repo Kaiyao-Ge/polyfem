@@ -7,9 +7,13 @@
 #include <polyfem/assembler/MatParams.hpp>
 #include <polyfem/utils/Logger.hpp>
 #include <ipc/utils/eigen_ext.hpp>
+#include <polyfem/assembler/LocalCapture.hpp>
+#include <polyfem/assembler/NeoHookeanElasticity.hpp>
 #include <polyfem/utils/MaybeParallelFor.hpp>
 #include <polyfem/utils/Timer.hpp>
 #include <polyfem/utils/Jacobian.hpp>
+
+#include "FastP1.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -274,8 +278,28 @@ namespace polyfem::solver
 		}
 	}
 
+	struct ElasticForm::FastP1Data
+	{
+		using Index = StiffnessMatrix::StorageIndex;
+		int n = 0;    ///< elements
+		int ndof = 0; ///< full dofs
+		std::vector<fastp1::Elem> el;
+		std::vector<Index> outer, inner; ///< CSC pattern (the union of the 12 x 12 element blocks, rows sorted)
+		std::vector<Index> scatter;      ///< n * 144: position in the values of local entry (a, b) at a + 12 b
+	};
+
+	bool ElasticForm::fast_active() const
+	{
+		if (!fast_requested_)
+			return false;
+		std::call_once(fast_once_, [this]() { fast_init(); });
+		return fast_on_;
+	}
+
 	double ElasticForm::value_unweighted(const Eigen::VectorXd &x) const
 	{
+		if (fast_active())
+			return fast_energy(x);
 		return assembler_.assemble_energy(
 			is_volume_,
 			bases_, geom_bases_, ass_vals_cache_, t_, dt_, x, x_prev_);
@@ -291,6 +315,11 @@ namespace polyfem::solver
 
 	void ElasticForm::first_derivative_unweighted(const Eigen::VectorXd &x, Eigen::VectorXd &gradv) const
 	{
+		if (fast_active())
+		{
+			fast_gradient(x, gradv);
+			return;
+		}
 		Eigen::MatrixXd grad;
 		assembler_.assemble_gradient(is_volume_, n_bases_, bases_, geom_bases_,
 									 ass_vals_cache_, t_, dt_, x, x_prev_, grad);
@@ -300,6 +329,12 @@ namespace polyfem::solver
 	void ElasticForm::second_derivative_unweighted(const Eigen::VectorXd &x, StiffnessMatrix &hessian) const
 	{
 		POLYFEM_SCOPED_TIMER("elastic hessian");
+
+		if (fast_active())
+		{
+			fast_hessian(x, hessian);
+			return;
+		}
 
 		hessian.resize(x.size(), x.size());
 
@@ -329,6 +364,27 @@ namespace polyfem::solver
 		const auto *nl = dynamic_cast<const assembler::NLAssembler *>(&assembler_);
 		if (nl == nullptr)
 			throw std::runtime_error("ElasticForm::element_local: the assembler has no local derivatives");
+		if (fast_active())
+		{
+			const fastp1::Elem &el = fast_->el[e];
+			const double f = weight() / scale();
+			Eigen::Matrix<double, 12, 1> g;
+			double energy;
+			if (with_hessian)
+			{
+				Eigen::Matrix<double, 12, 12> H;
+				energy = fastp1::eval<true, true>(el, x.data(), g.data(), H.data());
+				out.H = H * f;
+			}
+			else
+				energy = fastp1::eval<true, false>(el, x.data(), g.data(), nullptr);
+			out.g = g * f;
+			if (with_energy)
+				out.E = energy * f;
+			out.dofs.assign(el.dofs, el.dofs + 12);
+			out.w.assign(12, 1.0);
+			return;
+		}
 		ass_vals_cache_.compute(e, is_volume_, bases_[e], geom_bases_[e], vals);
 		const quadrature::Quadrature &quadrature = vals.quadrature;
 		const QuadratureVector da = vals.det.array() * quadrature.weights.array();
@@ -361,6 +417,13 @@ namespace polyfem::solver
 		const auto *nl = dynamic_cast<const assembler::NLAssembler *>(&assembler_);
 		if (nl == nullptr)
 			throw std::runtime_error("ElasticForm::subset_energy: the assembler has no local derivatives");
+		if (fast_active())
+		{
+			double res = 0;
+			for (const int e : ids)
+				res += fastp1::eval<false, false>(fast_->el[e], x.data(), nullptr, nullptr);
+			return res * (weight() / scale());
+		}
 		const Eigen::MatrixXd xm = x;
 		struct TD
 		{
@@ -387,6 +450,19 @@ namespace polyfem::solver
 	void ElasticForm::subset_gradient(const Eigen::VectorXd &x, const std::vector<int> &ids, Eigen::VectorXd &grad) const
 	{
 		grad = Eigen::VectorXd::Zero(x.size());
+		if (fast_active())
+		{
+			const double f = weight() / scale();
+			double g[12];
+			for (const int e : ids)
+			{
+				const fastp1::Elem &el = fast_->el[e];
+				fastp1::eval<true, false>(el, x.data(), g, nullptr);
+				for (int j = 0; j < 12; ++j)
+					grad[el.dofs[j]] += g[j] * f;
+			}
+			return;
+		}
 		const Eigen::MatrixXd xm = x;
 		struct TD
 		{
@@ -416,6 +492,39 @@ namespace polyfem::solver
 
 	void ElasticForm::subset_hessian(const Eigen::VectorXd &x, const std::vector<int> &ids, const bool project, StiffnessMatrix &hessian) const
 	{
+		if (fast_active())
+		{
+			const double f = weight() / scale();
+			std::vector<double> Hl(ids.size() * 144);
+			utils::maybe_parallel_for(int(ids.size()), [&](int start, int end, int /*thread_id*/) {
+				for (int k = start; k < end; ++k)
+				{
+					double *h = Hl.data() + std::size_t(k) * 144;
+					fastp1::eval<false, true>(fast_->el[ids[k]], x.data(), nullptr, h);
+					for (int i = 0; i < 144; ++i)
+						h[i] *= f;
+					if (project)
+					{
+						const Eigen::MatrixXd P = ipc::project_to_psd(Eigen::MatrixXd(Eigen::Map<const Eigen::Matrix<double, 12, 12>>(h)));
+						Eigen::Map<Eigen::Matrix<double, 12, 12>> hm(h);
+						hm = P;
+					}
+				}
+			});
+			std::vector<Eigen::Triplet<double>> trip;
+			trip.reserve(ids.size() * 144);
+			for (std::size_t k = 0; k < ids.size(); ++k)
+			{
+				const fastp1::Elem &el = fast_->el[ids[k]];
+				const double *h = Hl.data() + k * 144;
+				for (int i = 0; i < 12; ++i)
+					for (int j = 0; j < 12; ++j)
+						trip.emplace_back(el.dofs[i], el.dofs[j], h[i + 12 * j]);
+			}
+			hessian.resize(x.size(), x.size());
+			hessian.setFromTriplets(trip.begin(), trip.end());
+			return;
+		}
 		const Eigen::MatrixXd xm = x;
 		struct TD
 		{
@@ -446,6 +555,248 @@ namespace polyfem::solver
 						trip.emplace_back(dl[k][i], dl[k][j], Hl[k](i, j) * wl[k][i] * wl[k][j]);
 		hessian.resize(x.size(), x.size());
 		hessian.setFromTriplets(trip.begin(), trip.end());
+	}
+
+	void ElasticForm::fast_init() const
+	{
+		const auto fail = [&](const std::string &why) {
+			logger().warn("[NonsmoothNewton] the closed-form P1 kernel is not applicable ({}): the assembler is used", why);
+			fast_on_ = false;
+			fast_.reset();
+		};
+		const auto *nh = dynamic_cast<const assembler::NeoHookeanElasticity *>(&assembler_);
+		const auto *nl = dynamic_cast<const assembler::NLAssembler *>(&assembler_);
+		if (nh == nullptr || nl == nullptr)
+			return fail("assembler " + assembler_.name() + " is not NeoHookean");
+		if (!is_volume_ || assembler_.size() != 3)
+			return fail("not three-dimensional");
+		if (check_inversion_ != ElementInversionCheck::Discrete)
+			return fail("conservative element inversion check (quadrature refinement)");
+		if (bases_.empty())
+			return fail("no elements");
+		auto D = std::make_shared<FastP1Data>();
+		D->n = int(bases_.size());
+		D->ndof = n_bases_ * 3;
+		D->el.resize(D->n);
+		const double tprobe[3] = {t_, t_ + 1.0, t_ + 0.37};
+		assembler::ElementAssemblyValues vals;
+		for (int e = 0; e < D->n; ++e)
+		{
+			ass_vals_cache_.compute(e, is_volume_, bases_[e], geom_bases_[e], vals);
+			if (vals.basis_values.size() != 4)
+				return fail("element " + std::to_string(e) + " is not a linear tetrahedron");
+			if (vals.quadrature.weights.size() != 1 || vals.det.size() != 1 || vals.jac_it.size() != 1)
+				return fail("element " + std::to_string(e) + " has more than one quadrature point");
+			fastp1::Elem &el = D->el[e];
+			Eigen::Matrix<double, 4, 3> grad;
+			for (int i = 0; i < 4; ++i)
+			{
+				const auto &bs = vals.basis_values[i];
+				if (bs.global.size() != 1 || bs.global[0].val != 1.0)
+					return fail("element " + std::to_string(e) + " has a non-conforming node");
+				grad.row(i) = bs.grad.row(0);
+				for (int m = 0; m < 3; ++m)
+				{
+					const long d = long(bs.global[0].index) * 3 + m;
+					if (d < 0 || d >= D->ndof)
+						return fail("dof out of range");
+					el.dofs[3 * i + m] = int(d);
+				}
+			}
+			const Eigen::Matrix<double, 3, 3> jac_it = vals.jac_it[0];
+			const Eigen::Matrix<double, 4, 3> B = grad * jac_it;
+			for (int i = 0; i < 4; ++i)
+				for (int k = 0; k < 3; ++k)
+					el.B[3 * i + k] = B(i, k);
+			fastp1::fill_derived(el);
+			el.da = vals.det(0) * vals.quadrature.weights(0);
+			// Lame parameters: they must not depend on the position inside the element nor on the time
+			double lam, mu;
+			nh->lame_params().lambda_mu(vals.quadrature.points.row(0), vals.val.row(0), t_, vals.element_id, lam, mu);
+			el.lambda = lam;
+			el.mu = mu;
+			for (int pr = 0; pr < 8; ++pr)
+			{
+				Eigen::RowVector3d p;
+				if (pr < 4)
+					p = bases_[e].bases[pr].global()[0].node;
+				else if (pr == 4)
+					p = vals.val.row(0) + Eigen::RowVector3d(0.37, -0.21, 0.55);
+				else
+					p = vals.val.row(0) * 1.7 + Eigen::RowVector3d(0.1 * pr, 0.0, -0.3);
+				for (const double tt : tprobe)
+				{
+					double l2, m2;
+					nh->lame_params().lambda_mu(vals.quadrature.points.row(0), p, tt, vals.element_id, l2, m2);
+					if (l2 != lam || m2 != mu)
+						return fail("the Lame parameters of element " + std::to_string(e) + " depend on position or time");
+				}
+			}
+		}
+		// sparse pattern: the union of the element blocks (what the original assembly produces)
+		{
+			using Index = FastP1Data::Index;
+			std::vector<std::vector<Index>> cols(D->ndof);
+			for (int e = 0; e < D->n; ++e)
+				for (int b = 0; b < 12; ++b)
+				{
+					auto &c = cols[D->el[e].dofs[b]];
+					for (int a = 0; a < 12; ++a)
+						c.push_back(Index(D->el[e].dofs[a]));
+				}
+			D->outer.assign(D->ndof + 1, 0);
+			for (int c = 0; c < D->ndof; ++c)
+			{
+				auto &v = cols[c];
+				std::sort(v.begin(), v.end());
+				v.erase(std::unique(v.begin(), v.end()), v.end());
+				D->outer[c + 1] = D->outer[c] + Index(v.size());
+			}
+			D->inner.resize(std::size_t(D->outer[D->ndof]));
+			for (int c = 0; c < D->ndof; ++c)
+				std::copy(cols[c].begin(), cols[c].end(), D->inner.begin() + D->outer[c]);
+			D->scatter.resize(std::size_t(D->n) * 144);
+			for (int e = 0; e < D->n; ++e)
+				for (int b = 0; b < 12; ++b)
+				{
+					const int c = D->el[e].dofs[b];
+					const auto first = D->inner.begin() + D->outer[c], last = D->inner.begin() + D->outer[c + 1];
+					for (int a = 0; a < 12; ++a)
+					{
+						const auto it = std::lower_bound(first, last, Index(D->el[e].dofs[a]));
+						D->scatter[std::size_t(e) * 144 + a + 12 * b] = Index(it - D->inner.begin());
+					}
+				}
+		}
+		// self-check against the assembler on a small smooth deformation (catches an unsupported configuration, e.g. a robust Jacobian)
+		{
+			Eigen::MatrixXd x(D->ndof, 1);
+			for (int k = 0; k < D->ndof; ++k)
+				x(k) = 1e-3 * std::sin(0.7 * k + 0.3);
+			double eg = 0, eh = 0, ee = 0;
+			for (int e = 0; e < D->n; ++e)
+			{
+				ass_vals_cache_.compute(e, is_volume_, bases_[e], geom_bases_[e], vals);
+				const QuadratureVector da = vals.det.array() * vals.quadrature.weights.array();
+				const assembler::NonLinearAssemblerData data(vals, t_, dt_, x, x_prev_, da);
+				const double E0 = nl->compute_energy(data);
+				const Eigen::VectorXd g0 = nl->assemble_gradient(data);
+				const Eigen::MatrixXd H0 = nl->assemble_hessian(data);
+				double g1[12], H1[144];
+				const double E1 = fastp1::eval<true, true>(D->el[e], x.data(), g1, H1);
+				if (g0.size() != 12 || !(std::isfinite(E0) && std::isfinite(E1)))
+					return fail("self-check: element " + std::to_string(e));
+				ee = std::max(ee, std::abs(E1 - E0) / std::max(std::abs(E0), 1e-300));
+				eg = std::max(eg, (Eigen::Map<Eigen::VectorXd>(g1, 12) - g0).norm() / std::max(g0.norm(), 1e-300));
+				eh = std::max(eh, (Eigen::Map<Eigen::Matrix<double, 12, 12>>(H1) - H0).norm() / std::max(H0.norm(), 1e-300));
+			}
+			if (!(eg < 1e-6 && eh < 1e-6 && ee < 1e-3))
+				return fail(fmt::format("self-check failed (energy {:.2e}, gradient {:.2e}, Hessian {:.2e})", ee, eg, eh));
+		}
+		fast_ = D;
+		fast_on_ = true;
+	}
+
+	double ElasticForm::fast_energy(const Eigen::VectorXd &x) const
+	{
+		const FastP1Data &D = *fast_;
+		struct S
+		{
+			double v = 0;
+		};
+		auto st = utils::create_thread_storage(S());
+		utils::maybe_parallel_for(D.n, [&](int start, int end, int thread_id) {
+			S &s = utils::get_local_thread_storage(st, thread_id);
+			for (int e = start; e < end; ++e)
+				s.v += fastp1::eval<false, false>(D.el[e], x.data(), nullptr, nullptr);
+		});
+		double res = 0;
+		for (const S &s : st)
+			res += s.v;
+		return res;
+	}
+
+	void ElasticForm::fast_gradient(const Eigen::VectorXd &x, Eigen::VectorXd &gradv) const
+	{
+		const FastP1Data &D = *fast_;
+		assembler::LocalCapture *const capture = assembler::local_capture(); // EV2 unit cache
+		struct S
+		{
+			Eigen::VectorXd v;
+		};
+		S init;
+		init.v = Eigen::VectorXd::Zero(D.ndof);
+		auto st = utils::create_thread_storage(init);
+		utils::maybe_parallel_for(D.n, [&](int start, int end, int thread_id) {
+			S &s = utils::get_local_thread_storage(st, thread_id);
+			double g[12];
+			for (int e = start; e < end; ++e)
+			{
+				const fastp1::Elem &el = D.el[e];
+				fastp1::eval<true, false>(el, x.data(), g, nullptr);
+				if (capture != nullptr && capture->g != nullptr)
+				{
+					if (e < capture->n)
+						std::copy(g, g + 12, capture->g + std::size_t(e) * assembler::LocalCapture::NLOC);
+					else
+						++capture->bad;
+				}
+				for (int j = 0; j < 12; ++j)
+					s.v[el.dofs[j]] += g[j];
+			}
+		});
+		gradv = Eigen::VectorXd::Zero(D.ndof);
+		for (const S &s : st)
+			gradv += s.v;
+	}
+
+	void ElasticForm::fast_hessian(const Eigen::VectorXd &x, StiffnessMatrix &hessian) const
+	{
+		const FastP1Data &D = *fast_;
+		assembler::LocalCapture *const capture = assembler::local_capture();
+		const bool project = project_to_psd_;
+		const std::size_t nnz = D.inner.size();
+		struct S
+		{
+			std::vector<double> v;
+		};
+		S init;
+		init.v.assign(nnz, 0.0);
+		auto st = utils::create_thread_storage(init);
+		utils::maybe_parallel_for(D.n, [&](int start, int end, int thread_id) {
+			S &s = utils::get_local_thread_storage(st, thread_id);
+			double H[144];
+			for (int e = start; e < end; ++e)
+			{
+				fastp1::eval<false, true>(D.el[e], x.data(), nullptr, H);
+				if (capture != nullptr && capture->H != nullptr)
+				{
+					if (e < capture->n)
+						std::copy(H, H + 144, capture->H + std::size_t(e) * 144);
+					else
+						++capture->bad;
+				}
+				if (project)
+				{
+					const Eigen::MatrixXd P = ipc::project_to_psd(Eigen::MatrixXd(Eigen::Map<const Eigen::Matrix<double, 12, 12>>(H)));
+					Eigen::Map<Eigen::Matrix<double, 12, 12>> hm(H);
+					hm = P;
+				}
+				const FastP1Data::Index *sc = D.scatter.data() + std::size_t(e) * 144;
+				for (int k = 0; k < 144; ++k)
+					s.v[sc[k]] += H[k];
+			}
+		});
+		S *sum = nullptr;
+		for (S &s : st)
+		{
+			if (sum == nullptr)
+				sum = &s;
+			else
+				for (std::size_t i = 0; i < nnz; ++i)
+					sum->v[i] += s.v[i];
+		}
+		hessian = Eigen::Map<const StiffnessMatrix>(D.ndof, D.ndof, StiffnessMatrix::StorageIndex(nnz), D.outer.data(), D.inner.data(), sum->v.data());
 	}
 
 	void ElasticForm::finish()

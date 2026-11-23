@@ -21,6 +21,7 @@ namespace polyfem::solver
 		bool present_only = true;
 		bool born_hold = true;
 		bool exit_all = true; ///< exit_at = all_changes (else time_step)
+		bool unsupported_remainder = false; ///< unsupported_forms = remainder
 		std::string al_stage = "newton";
 		bool wall_enabled = false;
 		double wall_threshold = 1.2;

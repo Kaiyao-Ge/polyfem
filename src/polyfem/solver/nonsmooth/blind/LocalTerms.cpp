@@ -19,21 +19,18 @@ namespace polyfem::solver
 		return k;
 	}
 
-	namespace
+	bool is_node_block_diagonal(const StiffnessMatrix &H, const int dim)
 	{
-		/// True if every entry of the Hessian lies in the 3 x 3 block of one node
-		bool node_block_diagonal(const StiffnessMatrix &H, const int dim)
-		{
-			for (int c = 0; c < H.outerSize(); ++c)
-				for (StiffnessMatrix::InnerIterator it(H, c); it; ++it)
-					if (it.value() != 0 && it.row() / dim != it.col() / dim)
-						return false;
-			return true;
-		}
-	} // namespace
+		for (int c = 0; c < H.outerSize(); ++c)
+			for (StiffnessMatrix::InnerIterator it(H, c); it; ++it)
+				if (it.value() != 0 && it.row() / dim != it.col() / dim)
+					return false;
+		return true;
+	}
 
 	BlindForms BlindForms::classify(const std::vector<std::shared_ptr<Form>> &forms, const std::shared_ptr<Form> &elastic,
-									const std::shared_ptr<Form> &contact, const std::shared_ptr<Form> &friction, const Eigen::VectorXd &x0, const int dim)
+									const std::shared_ptr<Form> &contact, const std::shared_ptr<Form> &friction, const Eigen::VectorXd &x0, const int dim,
+									const std::vector<std::shared_ptr<Form>> &skip, const bool remainder)
 	{
 		BlindForms out;
 		std::string refused;
@@ -41,7 +38,7 @@ namespace polyfem::solver
 		{
 			if (f == elastic || f == contact || f == friction)
 				continue;
-			if (!f->enabled())
+			if (!f->enabled() || std::find(skip.begin(), skip.end(), f) != skip.end())
 				continue;
 			// a node-local form: its Hessian couples only the dofs of one node (checked here at the first point; the
 			// lumped inertia has the diagonal mass, the body force no Hessian)
@@ -53,7 +50,7 @@ namespace polyfem::solver
 				f->set_project_to_psd(false);
 				f->second_derivative(x0, H);
 				f->set_project_to_psd(flag);
-				ok = node_block_diagonal(H, dim);
+				ok = is_node_block_diagonal(H, dim);
 			}
 			catch (const std::exception &)
 			{
@@ -64,8 +61,8 @@ namespace polyfem::solver
 			else
 				refused += (refused.empty() ? "" : ", ") + f->name();
 		}
-		if (!refused.empty())
-			log_and_throw_error("NonsmoothNewton: selection = blind cannot split the form(s) [{}] into units (blind/unsupported_forms = error). Supported: the elastic form, barrier contact, and node-local forms (lumped mass inertia, body force).", refused);
+		if (!refused.empty() && !remainder)
+			log_and_throw_error("NonsmoothNewton: selection = blind cannot split the form(s) [{}] into units (blind/unsupported_forms = error). Supported: the elastic form, barrier contact, the consistent mass inertia, and node-local forms (lumped mass inertia, body force, lagged regularization); blind/unsupported_forms = remainder keeps the others in the frozen part.", refused);
 		return out;
 	}
 

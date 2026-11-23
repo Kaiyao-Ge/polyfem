@@ -134,6 +134,11 @@ namespace polyfem::solver
 		t.g.resize(t.n);
 		t.H.resize(t.n);
 		t.w.resize(t.n);
+		const bool has_mass = mass_ != nullptr && a.ig.size() == std::size_t(nel) * NL;
+		t.xg.assign(t.n, nullptr);
+		t.xm.assign(t.n, nullptr);
+		t.xw.assign(t.n, 0.0);
+		t.Hf.assign(t.n, nullptr);
 		for (int e = 0; e < nel; ++e)
 		{
 			t.key[e] = ekey_[e];
@@ -142,6 +147,12 @@ namespace polyfem::solver
 			t.g[e] = a.g.data() + std::size_t(e) * NL;
 			t.H[e] = a.H.data() + std::size_t(e) * NL * NL;
 			t.w[e] = a.f;
+			if (has_mass)
+			{
+				t.xg[e] = a.ig.data() + std::size_t(e) * NL;
+				t.xm[e] = mass_->m.data() + std::size_t(e) * 10;
+				t.xw[e] = a.wm;
+			}
 		}
 		for (int k = 0; k < nno; ++k)
 		{
@@ -162,6 +173,8 @@ namespace polyfem::solver
 			t.g[u] = a.coll.g.data() + std::size_t(j) * NL;
 			t.H[u] = a.coll.H.data() + std::size_t(j) * NL * NL;
 			t.w[u] = 1.0;
+			if (a.coll.Hf.size() == a.coll.H.size())
+				t.Hf[u] = a.coll.Hf.data() + std::size_t(j) * NL * NL;
 		}
 	}
 } // namespace polyfem::solver

@@ -28,6 +28,8 @@ namespace polyfem::solver
 	class BilateralSegmentCertifier;
 	class FastTetValidity;
 	class ElasticForm;
+	struct RepairUnit;
+	class BasisRepair;
 
 	/// @brief True if the nonlinear solver parameters select polysolve's NonsmoothNewton strategy
 	bool selects_nonsmooth_newton(const json &nonlinear_params);
@@ -121,7 +123,6 @@ namespace polyfem::solver
 
 	protected:
 		// --- first layer in the energy split: the lifted elastic elements (the lift set of the time step) ---
-		friend class LiftBasis;
 		bool lift_exact() const;
 		void init_lift();
 		void sync_lift();
@@ -134,7 +135,11 @@ namespace polyfem::solver
 		std::shared_ptr<LiftSet> lift_;
 		std::shared_ptr<ElasticForm> elastic_;
 		std::unique_ptr<FirstLayer> first_layer_;
-		std::unique_ptr<polysolve::nonlinear::BasisPort> basis_port_;
+		std::unique_ptr<BasisRepair> basis_port_;
+		std::vector<int> full_of_red_; ///< inverse of red_of_full_ (made on first use)
+		bool lift_correction(const Eigen::VectorXd &x, const bool projected, StiffnessMatrix &dB);
+		int node_of_unknown(const long index);
+		void repair_units(const Eigen::VectorXd &x, std::vector<RepairUnit> &units);
 		std::vector<int> pending_;       ///< lifted since the last take_delta
 		std::vector<char> lift_mask_;    ///< per tet: lifted
 		std::vector<char> jratio_mask_;  ///< per tet: counts for the Jacobian bound (the exact elements do not)

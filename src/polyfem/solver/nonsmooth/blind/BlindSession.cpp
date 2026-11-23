@@ -36,6 +36,7 @@ namespace polyfem::solver
 			o.born_hold = value_or(b, "born_hold", o.born_hold);
 			o.exit_all = value_or(b, "exit_at", std::string("all_changes")) == "all_changes";
 			o.al_stage = value_or(b, "al_stage", o.al_stage);
+			o.unsupported_remainder = value_or(b, "unsupported_forms", std::string("error")) == "remainder";
 			if (value_or(b, "unit_partition", std::string("local_term")) != "local_term")
 				log_and_throw_error("NonsmoothNewton: blind/unit_partition must be local_term");
 			if (b.contains("wall_switch"))

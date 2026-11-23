@@ -6,6 +6,7 @@
 #include <polyfem/solver/NLProblem.hpp>
 #include <polyfem/solver/forms/BarrierContactForm.hpp>
 #include <polyfem/solver/forms/ElasticForm.hpp>
+#include <polyfem/solver/nonsmooth/BasisRepair.hpp>
 #include <polyfem/solver/forms/Form.hpp>
 #include <polyfem/solver/forms/FrictionForm.hpp>
 #include <polyfem/utils/Logger.hpp>
@@ -297,33 +298,77 @@ namespace polyfem::solver
 	}
 
 	/// The projected block of the lifted elements that B takes where the model keeps the frozen one (lift_model frozen)
-	class LiftBasis : public polysolve::nonlinear::BasisPort
+	bool BarrierContactNonsmoothTerm::lift_correction(const Vec &x, const bool projected, StiffnessMatrix &dB)
 	{
-	public:
-		explicit LiftBasis(BarrierContactNonsmoothTerm &term) : term_(term) {}
-		bool correction(const Vec &x, const bool projected, StiffnessMatrix &dB) override
-		{
-			if (projected || term_.lift_->ids.empty() || term_.problem_.uses_full_size())
-				return false;
-			const Vec xf = term_.problem_.reduced_to_full(x);
-			StiffnessMatrix raw, proj;
-			term_.elastic_->subset_hessian(xf, term_.lift_->ids, false, raw);
-			term_.elastic_->subset_hessian(xf, term_.lift_->ids, true, proj);
-			dB = proj - raw;
-			term_.to_reduced(dB);
-			return true;
-		}
+		if (!first_layer_ || opts_.lift_model != "frozen" || projected || lift_->ids.empty() || problem_.uses_full_size())
+			return false;
+		const Vec xf = problem_.reduced_to_full(x);
+		StiffnessMatrix raw, proj;
+		elastic_->subset_hessian(xf, lift_->ids, false, raw);
+		elastic_->subset_hessian(xf, lift_->ids, true, proj);
+		dB = proj - raw;
+		to_reduced(dB);
+		return true;
+	}
 
-	private:
-		BarrierContactNonsmoothTerm &term_;
-	};
+	int BarrierContactNonsmoothTerm::node_of_unknown(const long index)
+	{
+		if (full_of_red_.empty())
+		{
+			int n = 0;
+			for (const int r : red_of_full_)
+				n = std::max(n, r + 1);
+			full_of_red_.assign(n, -1);
+			for (int i = 0; i < int(red_of_full_.size()); ++i)
+				if (red_of_full_[i] >= 0)
+					full_of_red_[red_of_full_[i]] = i;
+		}
+		return index >= 0 && index < long(full_of_red_.size()) && full_of_red_[index] >= 0 ? full_of_red_[index] / 3 : -1;
+	}
+
+	/// The elastic elements as units of the anchor x for the repair of B
+	void BarrierContactNonsmoothTerm::repair_units(const Vec &x, std::vector<RepairUnit> &units)
+	{
+		if (!local_ok_)
+			return;
+		std::shared_ptr<ElasticForm> elastic = elastic_;
+		for (const auto &f : other_)
+			if (!elastic)
+				elastic = std::dynamic_pointer_cast<ElasticForm>(f);
+		if (!elastic || !elastic->supports_local())
+			return;
+		const Eigen::MatrixXd xm = problem_.reduced_to_full(x);
+		assembler::ElementAssemblyValues vals;
+		ElasticForm::ElementLocal loc;
+		for (int e = 0; e < elastic->n_elements(); ++e)
+		{
+			elastic->element_local(xm, e, true, false, vals, loc);
+			RepairUnit r;
+			r.nd = int(loc.dofs.size());
+			if (r.nd != 12)
+				continue; // only linear tetrahedra
+			int nodes[4];
+			for (int j = 0; j < 12; ++j)
+			{
+				r.dof[j] = loc.dofs[j] >= 0 ? red_of_full_[loc.dofs[j]] : -1;
+				if (j % 3 == 0)
+					nodes[j / 3] = loc.dofs[j] / 3;
+			}
+			r.n_nodes = 4;
+			std::copy(nodes, nodes + 4, r.node.begin());
+			r.H = loc.H;
+			r.frozen = !is_exact_element(e);
+			units.push_back(std::move(r));
+		}
+	}
 
 	polysolve::nonlinear::BasisPort *BarrierContactNonsmoothTerm::basis()
 	{
-		if (!first_layer_ || opts_.lift_model != "frozen")
-			return nullptr;
 		if (!basis_port_)
-			basis_port_ = std::make_unique<LiftBasis>(*this);
+			basis_port_ = std::make_unique<BasisRepair>(
+				[this](const Vec &x, std::vector<RepairUnit> &units) { repair_units(x, units); },
+				[this](const long index) { return node_of_unknown(index); },
+				[this](const Vec &x, const bool projected, StiffnessMatrix &dB) { return lift_correction(x, projected, dB); });
 		return basis_port_.get();
 	}
 

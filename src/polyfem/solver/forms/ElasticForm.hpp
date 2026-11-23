@@ -11,6 +11,7 @@
 #include <polyfem/utils/Types.hpp>
 
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -115,6 +116,12 @@ namespace polyfem::solver
 		/// @brief True if the assembler provides local element derivatives with one full dof per local dof
 		bool supports_local() const;
 		int n_elements() const { return int(bases_.size()); }
+		/// @brief Use the closed-form kernel for linear tetrahedra with a NeoHookean material (FastP1.hpp) for the derivatives, the energy and
+		/// the local element quantities. It changes the rounding of the elastic terms (about 1e-13 relative). Falls back to the assembler (with a
+		/// warning) where it does not apply: other materials, other elements, material parameters that depend on position or time. Call before
+		/// the form is used.
+		void enable_fast_p1(const bool on) { fast_requested_ = on; }
+
 		/// @brief Local gradient (and Hessian, energy) of element e at x (full dofs, as a column matrix)
 		void element_local(const Eigen::MatrixXd &x, const int e, const bool with_hessian, const bool with_energy,
 						   assembler::ElementAssemblyValues &vals, ElementLocal &out) const;
@@ -128,6 +135,17 @@ namespace polyfem::solver
 		void subset_hessian(const Eigen::VectorXd &x, const std::vector<int> &ids, const bool project, StiffnessMatrix &hessian) const;
 
 	private:
+		struct FastP1Data;
+		bool fast_requested_ = false;
+		mutable std::shared_ptr<FastP1Data> fast_;
+		mutable std::once_flag fast_once_;
+		mutable bool fast_on_ = false;
+		bool fast_active() const;
+		void fast_init() const;
+		double fast_energy(const Eigen::VectorXd &x) const;
+		void fast_gradient(const Eigen::VectorXd &x, Eigen::VectorXd &gradv) const;
+		void fast_hessian(const Eigen::VectorXd &x, StiffnessMatrix &hessian) const;
+
 		const int n_bases_;
 		std::vector<basis::ElementBases> &bases_;
 		const std::vector<basis::ElementBases> &geom_bases_;

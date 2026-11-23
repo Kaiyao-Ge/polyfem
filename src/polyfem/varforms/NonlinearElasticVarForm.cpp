@@ -49,6 +49,8 @@
 #include <cmath>
 #include <limits>
 
+#include <random>
+
 namespace polyfem::varform
 {
 	using namespace solver;
@@ -83,6 +85,7 @@ namespace polyfem::varform
 		contact_dhat_was_explicit_ = false;
 		nonsmooth_fast_validity_ = nullptr;
 		nonsmooth_fast_validity_done_ = false;
+		nonsmooth_local_mass_ = nullptr;
 		collision_displacement_map_.resize(0, 0);
 	}
 
@@ -245,6 +248,7 @@ namespace polyfem::varform
 		// the NonsmoothNewton fast validity check caches the rest tets of the space
 		nonsmooth_fast_validity_ = nullptr;
 		nonsmooth_fast_validity_done_ = false;
+		nonsmooth_local_mass_ = nullptr;
 
 		problem->setup_bc(
 			mesh, assembler::BoundaryKind::NormalAlignedNeumann, /*fe_space_id=*/-1,
@@ -770,6 +774,19 @@ namespace polyfem::varform
 
 			if (sol.cols() > 1) // ignore previous solutions
 				sol.conservativeResize(Eigen::NoChange, 1);
+
+			// seeded perturbation of the initial solution (a different chaotic trajectory of the same problem): entries uniform in
+			// +-1e-12 x the bounding box diagonal of the mesh. Seed 0: none.
+			if (const uint64_t seed = args["solver"]["advanced"]["initial_perturbation_seed"].get<uint64_t>(); seed != 0)
+			{
+				RowVectorNd bmin, bmax;
+				mesh_->bounding_box(bmin, bmax);
+				const double amplitude = 1e-12 * (bmax - bmin).norm();
+				std::mt19937_64 rng(seed);
+				std::uniform_real_distribution<double> uniform(-1.0, 1.0);
+				for (Eigen::Index i = 0; i < sol.rows(); ++i)
+					sol(i, 0) += amplitude * uniform(rng);
+			}
 		}
 		if (has_macro_strain())
 		{
@@ -949,6 +966,9 @@ namespace polyfem::varform
 
 		for (const auto &form : forms)
 			form->set_output_dir(output_path);
+
+		if (solve_data_.elastic_form != nullptr)
+			solve_data_.elastic_form->enable_fast_p1(args["solver"]["advanced"]["fast_p1_kernel"]);
 
 		if (solve_data_.contact_form != nullptr)
 			solve_data_.contact_form->save_ccd_debug_meshes = args["output"]["advanced"]["save_ccd_debug_meshes"];
@@ -1380,12 +1400,8 @@ namespace polyfem::varform
 			log_and_throw_error("NonsmoothNewton: unknown selection {}", selection);
 		const solver::BlindParams blind_params = solver::BlindParams::from_json(nonlinear_params);
 		// the augmented Lagrangian subproblems: the Newton chain solves them unless blind/al_stage asks for the blind selection
-		if (selection == "blind" && al_stage)
-		{
-			if (blind_params.al_stage == "newton")
-				return nullptr;
-			log_and_throw_error("NonsmoothNewton: selection = blind in the augmented Lagrangian subproblems (blind/al_stage = blind) is not available yet");
-		}
+		if (selection == "blind" && al_stage && blind_params.al_stage == "newton")
+			return nullptr;
 		if (!nonsmooth_fast_validity_done_)
 		{
 			nonsmooth_fast_validity_ = solver::FastTetValidity::build(space_.basis_list(), space_.geometry_basis_list(), space_.n_bases, args["materials"]);
@@ -1404,9 +1420,17 @@ namespace polyfem::varform
 				session = std::make_shared<solver::BlindSession>(blind_params);
 				nl_problem.set_nonsmooth_session(session);
 			}
+			// the consistent mass: the element blocks of the mass matrix (made once, with the same call as the assembly of the mass matrix)
+			std::shared_ptr<const solver::LocalMass> local_mass;
+			if (solve_data_.inertia_form != nullptr && !args["solver"]["advanced"]["lump_mass_matrix"].get<bool>())
+			{
+				if (!nonsmooth_local_mass_)
+					nonsmooth_local_mass_ = solver::LocalMass::build(*mass_assembler_, mesh_->is_volume(), space_.basis_list(), space_.geometry_basis_list(), mass_ass_vals_cache_);
+				local_mass = nonsmooth_local_mass_;
+			}
 			return std::make_shared<solver::BlindUnitTerm>(
 				nl_problem, forms, pure_mass_ * Eigen::VectorXd::Ones(pure_mass_.cols()), collision_mesh_,
-				&collision_displacement_map_, nonsmooth_fast_validity_, opts, session);
+				&collision_displacement_map_, nonsmooth_fast_validity_, opts, session, local_mass, al_stage);
 		}
 		std::shared_ptr<solver::LiftSet> lift;
 		if (opts.first_layer)

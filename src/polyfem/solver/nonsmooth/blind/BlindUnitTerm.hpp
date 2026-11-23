@@ -4,11 +4,14 @@
 #include "UnitSelector.hpp"
 
 #include <polyfem/solver/BarrierContactNonsmoothTerm.hpp>
+#include <polyfem/solver/nonsmooth/BasisRepair.hpp>
 
 #include <ipc/collisions/normal/normal_collisions.hpp>
+#include <ipc/collisions/tangential/tangential_collisions.hpp>
 
 namespace polyfem::solver
 {
+	class InertiaForm;
 	/// @brief The nonsmooth term of the blind selection (NonsmoothNewton/selection = blind). The problem is split into units (the
 	/// local energy terms that depend on the same FE nodes: elastic elements, barrier collision pairs, node terms of the lumped
 	/// inertia and the body force); the exact term holds the units of the exact set S of the session (elastic elements and
@@ -27,7 +30,9 @@ namespace polyfem::solver
 					  const Eigen::SparseMatrix<double> *displacement_map,
 					  const std::shared_ptr<const FastTetValidity> &fast_validity,
 					  const Options &opts,
-					  const std::shared_ptr<BlindSession> &session);
+					  const std::shared_ptr<BlindSession> &session,
+					  const std::shared_ptr<const LocalMass> &mass = nullptr,
+					  const bool full_size = false);
 		~BlindUnitTerm() override;
 
 		void smooth_gradient(const Eigen::VectorXd &x, Eigen::VectorXd &grad) override;
@@ -40,7 +45,7 @@ namespace polyfem::solver
 
 		polysolve::nonlinear::FirstLayerPort *first_layer() override { return first_layer_blind_.get(); }
 		polysolve::nonlinear::SelectionPort *selection() override { return &port_; }
-		polysolve::nonlinear::BasisPort *basis() override { return nullptr; }
+		polysolve::nonlinear::BasisPort *basis() override;
 
 		/// @brief The previous anchor made again with the current functions (the energy changed since it was taken)
 		bool blind_reeval(const UnitCache::Anchor &prev, UnitCache::Anchor &out, const Eigen::VectorXd &xcur);
@@ -82,8 +87,20 @@ namespace polyfem::solver
 
 		/// the anchor of the full point xf with the barrier and node terms (made when it is new or of an earlier generation)
 		UnitCache::Anchor &blind_capture(const Vec &xf);
+		/// the units of the anchor x for the repair of B
+		void blind_repair_units(const Vec &x, std::vector<RepairUnit> &units);
+		/// the penalty terms of the augmented Lagrangian (full size) added to the node units
+		void add_penalty_to_nodes(const Vec &xf, NodeData &node) const;
+		/// the weighted local gradients of the consistent-mass inertia of every element at xf (anchor.ig, anchor.wm)
+		void fill_inertia(const Vec &xf, UnitCache::Anchor &anchor) const;
 		void fill_collisions(CollData &cd, const Vec &xfull);
 		UnitKey collision_key(const ipc::NormalCollisions &cs, const size_t i) const;
+		UnitKey tangent_key(const ipc::TangentialCollisions &fcs, const size_t i) const;
+		void add_friction_terms(CollData &cd, const Vec &xfull);
+		/// the lagged friction pairs whose unit is exact (key in S)
+		void friction_exact_list(std::vector<int> &idx) const;
+		/// PSD projection of the Hessian block of entry j: the barrier part is projected, the friction part is not
+		static Eigen::MatrixXd project_barrier_part(const CollData &cd, const int j, const Eigen::MatrixXd &H);
 		/// the collisions of the state that are exact: in S, or new at the state (not at the anchor)
 		void blind_exact_list(const ipc::NormalCollisions &cs, std::vector<int> &idx) const;
 		/// ids of the elastic elements in S (sorted), made again when S changed
@@ -94,12 +111,16 @@ namespace polyfem::solver
 		int ftb_limiting(const Vec &a, const Vec &b, const double tau);
 		int ccd_limiting();
 
+		bool full_size_ = false; ///< the term is for the full-size augmented Lagrangian subproblems (else the reduced problem)
 		std::shared_ptr<BlindSession> session_;
+		std::unique_ptr<BasisRepair> repair_port_;
 		std::unique_ptr<UnitSelector> selector_;
 		std::unique_ptr<FirstLayer> first_layer_blind_;
 		Port port_;
 		Sink sink_;
 		std::vector<std::shared_ptr<Form>> node_local_;
+		std::shared_ptr<InertiaForm> inertia_; ///< the inertia form if its mass is consistent (the element blocks are the units' inertia terms)
+		std::shared_ptr<const LocalMass> mass_;
 		std::unordered_map<UnitKey, int, UnitKeyHash> element_of_key_;
 		std::vector<int> sel_ids_; ///< sorted elastic elements of S
 		long sel_set_size_ = -1;   ///< the size of S that sel_ids_ was made for

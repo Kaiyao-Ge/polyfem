@@ -1728,6 +1728,8 @@
         "optional": [
             "cache_size",
             "lump_mass_matrix",
+            "fast_p1_kernel",
+            "initial_perturbation_seed",
             "lagged_regularization_weight",
             "lagged_regularization_iterations",
             "check_inversion",
@@ -1761,6 +1763,19 @@
         "default": false,
         "type": "bool",
         "doc": "If true, use diagonal mass matrix with entries on the diagonal equal to the sum of entries in each row of the full mass matrix.}"
+    },
+    {
+        "pointer": "/solver/advanced/fast_p1_kernel",
+        "default": false,
+        "type": "bool",
+        "doc": "Use a closed-form kernel for the energy, gradient and Hessian of linear tetrahedra with a NeoHookean material (one quadrature point, constant material parameters). It changes the rounding of the elastic terms (about 1e-13 relative). Falls back to the general assembly, with a warning, where it does not apply."
+    },
+    {
+        "pointer": "/solver/advanced/initial_perturbation_seed",
+        "default": 0,
+        "type": "int",
+        "min": 0,
+        "doc": "If not 0, the initial solution of a transient problem is perturbed by a vector with entries uniform in +-1e-12 times the bounding box diagonal of the mesh, seeded with this number (a different trajectory of a chaotic problem)."
     },
     {
         "pointer": "/solver/advanced/lagged_regularization_weight",
