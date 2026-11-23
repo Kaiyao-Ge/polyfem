@@ -289,6 +289,77 @@ TEST_CASE("nonsmooth_newton_contact_five_cubes", NONSMOOTH_NEWTON_SIM_TAGS)
 	CHECK(all_rc(o, "local_contact_blocks"));
 }
 
+TEST_CASE("nonsmooth_newton_contact_blind_selection", NONSMOOTH_NEWTON_SIM_TAGS)
+{
+	// the blind selection (units = local energy terms on the same nodes) solves the stack without intersections and reaches the
+	// minimizers of the energy split (compared at the end of the contact-free first steps, where the minimizer is unique)
+	const int steps = 12;
+	const std::string out = (std::filesystem::temp_directory_path() / "nonsmooth_newton_contact_blind.json").string();
+	json args = five_cubes(steps, "NonsmoothNewton", out);
+	args["/solver/nonlinear/NonsmoothNewton/selection"_json_pointer] = "blind";
+	std::shared_ptr<CheckedTransientVarForm> checked;
+	const Eigen::MatrixXd sol = run(args, &checked);
+	REQUIRE(sol.allFinite());
+	CHECK(checked->frames == steps);
+	CHECK(!checked->intersecting);
+	json o;
+	{
+		std::ifstream f(out);
+		REQUIRE(f.is_open());
+		f >> o;
+	}
+	CHECK(sum_stat(o, "ev_select_calls") > 0);
+	CHECK(sum_stat(o, "reread_calls") > 0);
+	CHECK(sum_stat(o, "path_iterations") > 0);
+	// the blind selection with the augmented Lagrangian stage left to the Newton chain (the default): the plane pushes the stack
+	// and the steps after the first contact start with augmented Lagrangian subproblems
+	json pushed = five_cubes_pushed(8, "NonsmoothNewton", "");
+	pushed["/solver/nonlinear/NonsmoothNewton/selection"_json_pointer] = "blind";
+	CHECK(run(pushed).allFinite());
+}
+
+TEST_CASE("nonsmooth_newton_contact_blind_rejects_unsupported", NONSMOOTH_NEWTON_SIM_TAGS)
+{
+	using Catch::Matchers::ContainsSubstring;
+	SECTION("friction")
+	{
+		json args = five_cubes(2, "NonsmoothNewton", "");
+		args["/solver/nonlinear/NonsmoothNewton/selection"_json_pointer] = "blind";
+		args["/contact/friction_coefficient"_json_pointer] = 0.3;
+		CHECK_THROWS_WITH(run(args), ContainsSubstring("friction"));
+	}
+	SECTION("augmented Lagrangian subproblems")
+	{
+		json args = five_cubes_pushed(8, "NonsmoothNewton", "");
+		args["/solver/nonlinear/NonsmoothNewton/selection"_json_pointer] = "blind";
+		args["/solver/nonlinear/NonsmoothNewton/blind/al_stage"_json_pointer] = "blind";
+		CHECK_THROWS_WITH(run(args), ContainsSubstring("not available yet"));
+	}
+}
+
+TEST_CASE("nonsmooth_newton_contact_first_layer", NONSMOOTH_NEWTON_SIM_TAGS)
+{
+	// the first layer in the energy split: elastic elements that cause a Jacobian cut become exact (T3: exact model, projected B)
+	const int steps = 12;
+	const std::string out = (std::filesystem::temp_directory_path() / "nonsmooth_newton_contact_first_layer.json").string();
+	json args = five_cubes(steps, "NonsmoothNewton", out);
+	args["/solver/nonlinear/NonsmoothNewton/first_layer/enabled"_json_pointer] = "on";
+	args["/solver/nonlinear/NonsmoothNewton/reread/enabled"_json_pointer] = "on";
+	std::shared_ptr<CheckedTransientVarForm> checked;
+	const Eigen::MatrixXd sol = run(args, &checked);
+	REQUIRE(sol.allFinite());
+	CHECK(checked->frames == steps);
+	CHECK(!checked->intersecting);
+	json o;
+	{
+		std::ifstream f(out);
+		REQUIRE(f.is_open());
+		f >> o;
+	}
+	CHECK(sum_stat(o, "reread_calls") > 0);
+	CHECK(sum_stat(o, "path_iterations") > 0);
+}
+
 TEST_CASE("nonsmooth_newton_contact_collision_proxy", NONSMOOTH_NEWTON_SIM_TAGS)
 {
 	// a sampled collision proxy (max_order tessellation, lattice order 4) has more collision vertices than FE nodes and
@@ -565,7 +636,7 @@ namespace
 				return;
 			using Vec = Eigen::VectorXd;
 			solver::NLProblem &nl = *solve_data_.nl_problem;
-			const auto term = make_nonsmooth_term(args["solver"]["nonlinear"]);
+			const auto term = std::dynamic_pointer_cast<solver::BarrierContactNonsmoothTerm>(make_nonsmooth_term(args["solver"]["nonlinear"]));
 			REQUIRE(term->friction() != nullptr);
 			pairs = long(term->friction()->friction_collision_set().size());
 			const Vec y = nl.full_to_reduced(Vec(sol));

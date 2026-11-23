@@ -1,5 +1,6 @@
 #include "ALSolver.hpp"
 
+#include <polyfem/solver/NonsmoothTerm.hpp>
 #include <polyfem/utils/Logger.hpp>
 
 namespace polyfem::solver
@@ -111,6 +112,7 @@ namespace polyfem::solver
 
 			for (auto &f : alagr_forms)
 				f->update_lagrangian(sol, al_weight);
+			nl_problem.energy_changed(EnergyChange::al_update);
 
 			post_subsolve(al_weight);
 			++al_steps;

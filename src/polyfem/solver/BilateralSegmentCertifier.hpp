@@ -2,6 +2,7 @@
 
 #include <Eigen/Core>
 
+#include <array>
 #include <memory>
 #include <vector>
 
@@ -41,6 +42,12 @@ namespace polyfem::solver
 		long n_ti = 0;        ///< pairs passed to TI
 		long n_dropped = 0;   ///< candidates removed by dedupe
 		long n_kept = 0;      ///< candidates kept by dedupe
+
+		/// The candidate that set the earliest time of impact of the last max_step_size call (only if it is what limited the returned
+		/// step): family 0 vertex-vertex, 1 edge-vertex, 2 edge-edge, 3 face-vertex (-1: none) and its vertex ids (collision mesh
+		/// numbering, -1 padded)
+		int limit_family = -1;
+		std::array<int, 4> limit_vis{{-1, -1, -1, -1}};
 
 	private:
 		NLProblem &problem_;

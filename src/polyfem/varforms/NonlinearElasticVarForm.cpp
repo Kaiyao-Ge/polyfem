@@ -21,6 +21,7 @@
 
 #include <polyfem/solver/ALSolver.hpp>
 #include <polyfem/solver/BarrierContactNonsmoothTerm.hpp>
+#include <polyfem/solver/nonsmooth/blind/BlindUnitTerm.hpp>
 #include <polyfem/solver/FastTetValidity.hpp>
 #include <polyfem/solver/forms/BarrierContactForm.hpp>
 #include <polyfem/solver/forms/PeriodicContactForm.hpp>
@@ -1371,17 +1372,56 @@ namespace polyfem::varform
 			log_and_throw_error("{}: needs a positive lumped mass", name);
 	}
 
-	std::shared_ptr<solver::BarrierContactNonsmoothTerm> NonlinearElasticVarForm::make_nonsmooth_term(const json &nonlinear_params)
+	std::shared_ptr<solver::NonsmoothTerm> NonlinearElasticVarForm::make_nonsmooth_term(const json &nonlinear_params, const bool al_stage)
 	{
+		const json &nsn = nonlinear_params.is_object() && nonlinear_params.contains("NonsmoothNewton") ? nonlinear_params["NonsmoothNewton"] : json::object();
+		const std::string selection = nsn.value("selection", std::string("energy_split"));
+		if (selection != "energy_split" && selection != "blind")
+			log_and_throw_error("NonsmoothNewton: unknown selection {}", selection);
+		const solver::BlindParams blind_params = solver::BlindParams::from_json(nonlinear_params);
+		// the augmented Lagrangian subproblems: the Newton chain solves them unless blind/al_stage asks for the blind selection
+		if (selection == "blind" && al_stage)
+		{
+			if (blind_params.al_stage == "newton")
+				return nullptr;
+			log_and_throw_error("NonsmoothNewton: selection = blind in the augmented Lagrangian subproblems (blind/al_stage = blind) is not available yet");
+		}
 		if (!nonsmooth_fast_validity_done_)
 		{
 			nonsmooth_fast_validity_ = solver::FastTetValidity::build(space_.basis_list(), space_.geometry_basis_list(), space_.n_bases, args["materials"]);
 			nonsmooth_fast_validity_done_ = true;
 		}
+		const auto opts = solver::BarrierContactNonsmoothTerm::Options::from_json(nonlinear_params);
+		solver::NLProblem &nl_problem = *solve_data_.nl_problem;
+		if (selection == "blind")
+		{
+			if (opts.lift_model != "exact" || opts.lift_basis != "projected")
+				log_and_throw_error("NonsmoothNewton: the blind selection supports only first_layer/lift_model = exact and lift_basis = projected");
+			// the exact set outlives the term (rebuilt for every solve): it lives in the session of the problem
+			auto session = std::dynamic_pointer_cast<solver::BlindSession>(nl_problem.nonsmooth_session());
+			if (!session)
+			{
+				session = std::make_shared<solver::BlindSession>(blind_params);
+				nl_problem.set_nonsmooth_session(session);
+			}
+			return std::make_shared<solver::BlindUnitTerm>(
+				nl_problem, forms, pure_mass_ * Eigen::VectorXd::Ones(pure_mass_.cols()), collision_mesh_,
+				&collision_displacement_map_, nonsmooth_fast_validity_, opts, session);
+		}
+		std::shared_ptr<solver::LiftSet> lift;
+		if (opts.first_layer)
+		{
+			// the lifted elements outlive the term (rebuilt for every solve): they live for the time step
+			lift = std::dynamic_pointer_cast<solver::LiftSet>(nl_problem.nonsmooth_session());
+			if (!lift)
+			{
+				lift = std::make_shared<solver::LiftSet>();
+				nl_problem.set_nonsmooth_session(lift);
+			}
+		}
 		return std::make_shared<solver::BarrierContactNonsmoothTerm>(
-			*solve_data_.nl_problem, forms, pure_mass_ * Eigen::VectorXd::Ones(pure_mass_.cols()), collision_mesh_,
-			&collision_displacement_map_, nonsmooth_fast_validity_,
-			solver::BarrierContactNonsmoothTerm::Options::from_json(nonlinear_params));
+			nl_problem, forms, pure_mass_ * Eigen::VectorXd::Ones(pure_mass_.cols()), collision_mesh_,
+			&collision_displacement_map_, nonsmooth_fast_validity_, opts, lift);
 	}
 
 	void NonlinearElasticVarForm::solve_tensor_nonlinear(
@@ -1391,6 +1431,7 @@ namespace polyfem::varform
 	{
 		assert(solve_data_.nl_problem != nullptr && "Nonlinear forms must initialize the nonlinear problem before solving");
 		solver::NLProblem &nl_problem = *(solve_data_.nl_problem);
+		nl_problem.begin_time_step(step);
 
 		assert(sol.size() == rhs_.size());
 
@@ -1447,7 +1488,7 @@ namespace polyfem::varform
 
 		Eigen::MatrixXd prev_sol = sol;
 		if (al_nonsmooth)
-			nl_problem.set_nonsmooth_term(make_nonsmooth_term(al_nonlinear_params));
+			nl_problem.set_nonsmooth_term(make_nonsmooth_term(al_nonlinear_params, true));
 		try
 		{
 			al_solver.solve_al(nl_problem, sol, al_nonlinear_params, args["solver"]["linear"], units.characteristic_length());
@@ -1487,6 +1528,7 @@ namespace polyfem::varform
 			Eigen::VectorXd tmp_sol = nl_problem.full_to_reduced(sol);
 
 			nl_problem.update_lagging(tmp_sol, lag_i);
+			nl_problem.energy_changed(solver::EnergyChange::friction_lag);
 
 			Eigen::VectorXd grad;
 			nl_problem.gradient(tmp_sol, grad);

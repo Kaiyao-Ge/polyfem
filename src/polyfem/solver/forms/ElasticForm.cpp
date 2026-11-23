@@ -6,6 +6,8 @@
 #include <polyfem/basis/ElementBases.hpp>
 #include <polyfem/assembler/MatParams.hpp>
 #include <polyfem/utils/Logger.hpp>
+#include <ipc/utils/eigen_ext.hpp>
+#include <polyfem/utils/MaybeParallelFor.hpp>
 #include <polyfem/utils/Timer.hpp>
 #include <polyfem/utils/Jacobian.hpp>
 
@@ -313,6 +315,137 @@ namespace polyfem::solver
 				is_volume_, n_bases_, project_to_psd_, bases_,
 				geom_bases_, ass_vals_cache_, t_, dt_, x, x_prev_, *mat_cache_, hessian);
 		}
+	}
+
+	// ---------------------------------------------------------------------------------------------- local derivatives
+	bool ElasticForm::supports_local() const
+	{
+		return dynamic_cast<const assembler::NLAssembler *>(&assembler_) != nullptr;
+	}
+
+	void ElasticForm::element_local(const Eigen::MatrixXd &x, const int e, const bool with_hessian, const bool with_energy,
+									assembler::ElementAssemblyValues &vals, ElementLocal &out) const
+	{
+		const auto *nl = dynamic_cast<const assembler::NLAssembler *>(&assembler_);
+		if (nl == nullptr)
+			throw std::runtime_error("ElasticForm::element_local: the assembler has no local derivatives");
+		ass_vals_cache_.compute(e, is_volume_, bases_[e], geom_bases_[e], vals);
+		const quadrature::Quadrature &quadrature = vals.quadrature;
+		const QuadratureVector da = vals.det.array() * quadrature.weights.array();
+		const assembler::NonLinearAssemblerData data(vals, t_, dt_, x, x_prev_, da);
+		const double f = weight() / scale();
+		out.g = nl->assemble_gradient(data) * f;
+		if (with_hessian)
+			out.H = nl->assemble_hessian(data) * f;
+		if (with_energy)
+			out.E = nl->compute_energy(data) * f;
+		const int size = assembler_.size();
+		const int n_loc = int(vals.basis_values.size());
+		out.dofs.assign(n_loc * size, -1);
+		out.w.assign(n_loc * size, 0.0);
+		for (int j = 0; j < n_loc; ++j)
+		{
+			const auto &global = vals.basis_values[j].global;
+			if (global.size() != 1)
+				throw std::runtime_error("ElasticForm::element_local: local basis with more than one global node");
+			for (int m = 0; m < size; ++m)
+			{
+				out.dofs[j * size + m] = int(global[0].index * size + m);
+				out.w[j * size + m] = global[0].val;
+			}
+		}
+	}
+
+	double ElasticForm::subset_energy(const Eigen::VectorXd &x, const std::vector<int> &ids) const
+	{
+		const auto *nl = dynamic_cast<const assembler::NLAssembler *>(&assembler_);
+		if (nl == nullptr)
+			throw std::runtime_error("ElasticForm::subset_energy: the assembler has no local derivatives");
+		const Eigen::MatrixXd xm = x;
+		struct TD
+		{
+			assembler::ElementAssemblyValues vals;
+			double sum = 0;
+		};
+		auto st = utils::create_thread_storage(TD());
+		utils::maybe_parallel_for(int(ids.size()), [&](int start, int end, int thread_id) {
+			TD &td = utils::get_local_thread_storage(st, thread_id);
+			for (int k = start; k < end; ++k)
+			{
+				const int e = ids[k];
+				ass_vals_cache_.compute(e, is_volume_, bases_[e], geom_bases_[e], td.vals);
+				const QuadratureVector da = td.vals.det.array() * td.vals.quadrature.weights.array();
+				td.sum += nl->compute_energy(assembler::NonLinearAssemblerData(td.vals, t_, dt_, xm, x_prev_, da));
+			}
+		});
+		double res = 0;
+		for (const auto &td : st)
+			res += td.sum;
+		return res * (weight() / scale());
+	}
+
+	void ElasticForm::subset_gradient(const Eigen::VectorXd &x, const std::vector<int> &ids, Eigen::VectorXd &grad) const
+	{
+		grad = Eigen::VectorXd::Zero(x.size());
+		const Eigen::MatrixXd xm = x;
+		struct TD
+		{
+			assembler::ElementAssemblyValues vals;
+			ElementLocal loc;
+		};
+		auto st = utils::create_thread_storage(TD());
+		// element gradients in parallel, scattered in the order of ids (deterministic)
+		std::vector<Eigen::VectorXd> gl(ids.size());
+		std::vector<std::vector<int>> dl(ids.size());
+		std::vector<std::vector<double>> wl(ids.size());
+		utils::maybe_parallel_for(int(ids.size()), [&](int start, int end, int thread_id) {
+			TD &td = utils::get_local_thread_storage(st, thread_id);
+			for (int k = start; k < end; ++k)
+			{
+				element_local(xm, ids[k], false, false, td.vals, td.loc);
+				gl[k] = td.loc.g;
+				dl[k] = td.loc.dofs;
+				wl[k] = td.loc.w;
+			}
+		});
+		for (size_t k = 0; k < ids.size(); ++k)
+			for (int j = 0; j < gl[k].size(); ++j)
+				if (dl[k][j] >= 0)
+					grad[dl[k][j]] += wl[k][j] * gl[k][j];
+	}
+
+	void ElasticForm::subset_hessian(const Eigen::VectorXd &x, const std::vector<int> &ids, const bool project, StiffnessMatrix &hessian) const
+	{
+		const Eigen::MatrixXd xm = x;
+		struct TD
+		{
+			assembler::ElementAssemblyValues vals;
+			ElementLocal loc;
+		};
+		auto st = utils::create_thread_storage(TD());
+		std::vector<Eigen::MatrixXd> Hl(ids.size());
+		std::vector<std::vector<int>> dl(ids.size());
+		std::vector<std::vector<double>> wl(ids.size());
+		utils::maybe_parallel_for(int(ids.size()), [&](int start, int end, int thread_id) {
+			TD &td = utils::get_local_thread_storage(st, thread_id);
+			for (int k = start; k < end; ++k)
+			{
+				element_local(xm, ids[k], true, false, td.vals, td.loc);
+				// element_local scales by weight / scale (> 0): the projection commutes with it
+				Hl[k] = project ? Eigen::MatrixXd(ipc::project_to_psd(td.loc.H)) : td.loc.H;
+				dl[k] = td.loc.dofs;
+				wl[k] = td.loc.w;
+			}
+		});
+		std::vector<Eigen::Triplet<double>> trip;
+		trip.reserve(ids.size() * 144);
+		for (size_t k = 0; k < ids.size(); ++k)
+			for (int i = 0; i < Hl[k].rows(); ++i)
+				for (int j = 0; j < Hl[k].cols(); ++j)
+					if (dl[k][i] >= 0 && dl[k][j] >= 0)
+						trip.emplace_back(dl[k][i], dl[k][j], Hl[k](i, j) * wl[k][i] * wl[k][j]);
+		hessian.resize(x.size(), x.size());
+		hessian.setFromTriplets(trip.begin(), trip.end());
 	}
 
 	void ElasticForm::finish()

@@ -130,15 +130,29 @@ namespace polyfem::solver
 	}
 
 	void FastTetValidity::min_jacobians(const Eigen::VectorXd &det_x, const Eigen::VectorXd &yf, const bool want_min, const bool want_ratio,
-										double &min_j, double &min_ratio) const
+										double &min_j, double &min_ratio, const std::vector<char> *ratio_mask) const
 	{
 		// both minima in one sweep (an entry not wanted stays +inf)
 		const std::array<double, 2> m = par_min<2>(n_tets(), [&](const int e) {
 			const double dy = tet_det(e, yf);
-			return std::array<double, 2>{{want_min ? dy / rest_det_[e] : INF, want_ratio ? dy / det_x[e] : INF}};
+			return std::array<double, 2>{{want_min ? dy / rest_det_[e] : INF, (want_ratio && (ratio_mask == nullptr || (*ratio_mask)[e])) ? dy / det_x[e] : INF}};
 		});
 		min_j = want_min ? m[0] : std::numeric_limits<double>::quiet_NaN();
 		min_ratio = want_ratio ? m[1] : std::numeric_limits<double>::quiet_NaN();
+	}
+
+	void FastTetValidity::jacobian_arrays(const Eigen::VectorXd &det_x, const Eigen::VectorXd &yf, std::vector<double> &J, std::vector<double> &ratio) const
+	{
+		J.resize(n_tets());
+		ratio.resize(n_tets());
+		utils::maybe_parallel_for(n_tets(), [&](int start, int end, int /*thread_id*/) {
+			for (int e = start; e < end; ++e)
+			{
+				const double dy = tet_det(e, yf);
+				J[e] = dy / rest_det_[e];
+				ratio[e] = dy / det_x[e];
+			}
+		});
 	}
 
 	double FastTetValidity::tet_det(int e, const Eigen::VectorXd &uf) const

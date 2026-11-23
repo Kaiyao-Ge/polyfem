@@ -5,12 +5,14 @@
 
 #include <polyfem/solver/NLProblem.hpp>
 #include <polyfem/solver/forms/BarrierContactForm.hpp>
+#include <polyfem/solver/forms/ElasticForm.hpp>
 #include <polyfem/solver/forms/Form.hpp>
 #include <polyfem/solver/forms/FrictionForm.hpp>
 #include <polyfem/utils/Logger.hpp>
 #include <polyfem/utils/MaybeParallelFor.hpp>
 
 #include <ipc/candidates/candidates.hpp>
+#include <ipc/utils/eigen_ext.hpp>
 #include <ipc/collision_mesh.hpp>
 #include <ipc/potentials/barrier_potential.hpp>
 
@@ -67,6 +69,14 @@ namespace polyfem::solver
 		if (!nonlinear_params.is_object() || !nonlinear_params.contains("NonsmoothNewton"))
 			return o;
 		const json &p = nonlinear_params["NonsmoothNewton"];
+		if (p.is_object() && p.contains("first_layer"))
+		{
+			const json &f = p["first_layer"];
+			const std::string enabled = value_or(f, "enabled", std::string("auto"));
+			o.first_layer = enabled == "on" || (enabled == "auto" && value_or(p, "selection", std::string("energy_split")) == "blind");
+			o.lift_model = value_or(f, "lift_model", o.lift_model);
+			o.lift_basis = value_or(f, "lift_basis", o.lift_basis);
+		}
 		if (!p.is_object() || !p.contains("debug"))
 			return o;
 		const json &d = p["debug"];
@@ -89,8 +99,9 @@ namespace polyfem::solver
 															 const ipc::CollisionMesh &collision_mesh,
 															 const Eigen::SparseMatrix<double> *displacement_map,
 															 const std::shared_ptr<const FastTetValidity> &fast_validity,
-															 const Options &opts)
-		: problem_(problem), mesh_(collision_mesh), displacement_map_(displacement_map), fast_validity_(fast_validity),
+															 const Options &opts,
+															 const std::shared_ptr<LiftSet> &lift)
+		: lift_(lift), problem_(problem), mesh_(collision_mesh), displacement_map_(displacement_map), fast_validity_(fast_validity),
 		  opts_(opts), mass_full_(mass_full), anchor_(std::make_unique<AnchorHolder>())
 	{
 		// the step bound of the certified narrow phase combines all other forms (friction included), as without the term
@@ -125,9 +136,196 @@ namespace polyfem::solver
 		h_edge_ = Ed.rows() ? sum / Ed.rows() : NaN;
 		if (opts_.local_blocks)
 			init_local_map();
+		if (opts_.first_layer && lift_ != nullptr)
+			init_lift();
 	}
 
 	BarrierContactNonsmoothTerm::~BarrierContactNonsmoothTerm() = default;
+
+	// ------------------------------------------------------------------------------------------------------- first layer
+	// The elastic elements that caused a cut of the path (a Jacobian limit) are the lifted elements: they leave the smooth part and
+	// the exact term gets their energy, gradient and Hessian blocks (lift_model exact), or they stay in the smooth part and only B
+	// (lift_basis projected: its correction dB, lift_model frozen) or the model's quadratic (frozen_projected) takes their
+	// projected block. The lift set lives for the time step (LiftSet).
+	bool BarrierContactNonsmoothTerm::lift_exact() const
+	{
+		return first_layer_ != nullptr && opts_.lift_model == "exact" && !lift_->ids.empty() && !problem_.uses_full_size();
+	}
+
+	void BarrierContactNonsmoothTerm::init_lift()
+	{
+		for (const auto &f : other_)
+			if (auto e = std::dynamic_pointer_cast<ElasticForm>(f))
+			{
+				if (elastic_)
+					log_and_throw_error("NonsmoothNewton: first_layer needs a single elastic form");
+				elastic_ = e;
+			}
+		if (!local_ok_ || !fast_validity_ || !elastic_ || !elastic_->supports_local())
+			log_and_throw_error("NonsmoothNewton: first_layer needs the local contact blocks (plain selection dof map, one FE node per collision vertex), P1 tetrahedra with a NeoHookean material and an elastic form with local derivatives");
+		if (opts_.lift_model == "frozen" && opts_.lift_basis == "raw")
+			log_and_throw_error("NonsmoothNewton: first_layer/lift_model frozen with lift_basis raw does not lift anything");
+		first_layer_ = std::make_unique<FirstLayer>(problem_, fast_validity_, static_cast<UnitSink &>(*this));
+		sync_lift();
+	}
+
+	void BarrierContactNonsmoothTerm::sync_lift()
+	{
+		const int nt = fast_validity_->n_tets();
+		lift_mask_.assign(nt, 0);
+		for (const int e : lift_->ids)
+			lift_mask_[e] = 1;
+		// the Jacobian bound sees the elements that are not exact (the floor and the validity stay over all)
+		if (opts_.lift_model == "exact" && !lift_->ids.empty())
+		{
+			jratio_mask_.assign(nt, 1);
+			for (const int e : lift_->ids)
+				jratio_mask_[e] = 0;
+		}
+		else
+			jratio_mask_.clear();
+	}
+
+	int BarrierContactNonsmoothTerm::add_elements(const std::vector<int> &ids)
+	{
+		int n = 0;
+		std::vector<int> merged = lift_->ids;
+		for (const int e : ids)
+			if (!lift_mask_[e])
+			{
+				lift_mask_[e] = 1;
+				merged.push_back(e);
+				pending_.push_back(e);
+				++n;
+			}
+		std::sort(merged.begin(), merged.end());
+		lift_->ids = std::move(merged);
+		sync_lift();
+		return n;
+	}
+
+	/// The elastic part of the exact term at yf: gradient (added to grad, full dofs) and one 12 x 12 block per lifted element
+	void BarrierContactNonsmoothTerm::lift_blocks(const Vec &yf, std::vector<polysolve::nonlinear::HessianBlock> &blocks, Vec &grad) const
+	{
+		const auto &ids = lift_->ids;
+		const Eigen::MatrixXd xm = yf;
+		const size_t n0 = blocks.size();
+		blocks.resize(n0 + ids.size());
+		struct TD
+		{
+			assembler::ElementAssemblyValues vals;
+			ElasticForm::ElementLocal loc;
+		};
+		auto st = utils::create_thread_storage(TD());
+		std::vector<Vec> gl(ids.size());
+		utils::maybe_parallel_for(int(ids.size()), [&](int start, int end, int thread_id) {
+			TD &td = utils::get_local_thread_storage(st, thread_id);
+			for (int k = start; k < end; ++k)
+			{
+				elastic_->element_local(xm, ids[k], true, false, td.vals, td.loc);
+				if (td.loc.g.size() != 12)
+					throw std::runtime_error("NonsmoothNewton: first_layer needs elements with 12 local dofs");
+				polysolve::nonlinear::HessianBlock &b = blocks[n0 + k];
+				b.size = 12;
+				b.H.topLeftCorner(12, 12) = td.loc.H;
+				for (int j = 0; j < 12; ++j)
+					b.indices[j] = red_of_full_[td.loc.dofs[j]];
+				gl[k] = td.loc.g;
+			}
+		});
+		for (size_t k = 0; k < ids.size(); ++k)
+		{
+			const auto &b = blocks[n0 + k];
+			for (int j = 0; j < 12; ++j)
+				if (const int r = b.indices[j]; r >= 0)
+					grad[r] += gl[k][j];
+		}
+	}
+
+	bool BarrierContactNonsmoothTerm::take_delta(const Vec &x, const bool projected, polysolve::nonlinear::NonsmoothDelta &delta)
+	{
+		std::vector<int> ids;
+		ids.swap(pending_);
+		if (ids.empty() || opts_.lift_model != "exact")
+			return false;
+		std::sort(ids.begin(), ids.end());
+		const Vec xf = problem_.reduced_to_full(x);
+		const int n = int(x.size());
+		const Eigen::MatrixXd xm = xf;
+		struct TD
+		{
+			assembler::ElementAssemblyValues vals;
+			ElasticForm::ElementLocal loc;
+		};
+		auto st = utils::create_thread_storage(TD());
+		std::vector<Eigen::MatrixXd> Hl(ids.size());
+		std::vector<Vec> gl(ids.size());
+		std::vector<std::vector<int>> dl(ids.size());
+		utils::maybe_parallel_for(int(ids.size()), [&](int start, int end, int thread_id) {
+			TD &td = utils::get_local_thread_storage(st, thread_id);
+			for (int k = start; k < end; ++k)
+			{
+				elastic_->element_local(xm, ids[k], true, false, td.vals, td.loc);
+				Hl[k] = projected ? Eigen::MatrixXd(ipc::project_to_psd(td.loc.H)) : td.loc.H;
+				gl[k] = td.loc.g;
+				dl[k] = td.loc.dofs;
+			}
+		});
+		std::vector<Eigen::Triplet<double>> trip;
+		trip.reserve(ids.size() * 144);
+		Vec dg = Vec::Zero(n);
+		for (size_t k = 0; k < ids.size(); ++k)
+			for (int a = 0; a < 12; ++a)
+			{
+				const int ra = dl[k][a] >= 0 ? red_of_full_[dl[k][a]] : -1;
+				if (ra < 0)
+					continue;
+				dg[ra] += gl[k][a];
+				for (int b = 0; b < 12; ++b)
+				{
+					const int rb = dl[k][b] >= 0 ? red_of_full_[dl[k][b]] : -1;
+					if (rb >= 0)
+						trip.emplace_back(ra, rb, Hl[k](a, b));
+				}
+			}
+		delta.dH.resize(n, n);
+		delta.dH.setFromTriplets(trip.begin(), trip.end());
+		delta.dg = dg;
+		delta.dE = elastic_->subset_energy(xf, ids);
+		delta.n = int(ids.size());
+		return true;
+	}
+
+	/// The projected block of the lifted elements that B takes where the model keeps the frozen one (lift_model frozen)
+	class LiftBasis : public polysolve::nonlinear::BasisPort
+	{
+	public:
+		explicit LiftBasis(BarrierContactNonsmoothTerm &term) : term_(term) {}
+		bool correction(const Vec &x, const bool projected, StiffnessMatrix &dB) override
+		{
+			if (projected || term_.lift_->ids.empty() || term_.problem_.uses_full_size())
+				return false;
+			const Vec xf = term_.problem_.reduced_to_full(x);
+			StiffnessMatrix raw, proj;
+			term_.elastic_->subset_hessian(xf, term_.lift_->ids, false, raw);
+			term_.elastic_->subset_hessian(xf, term_.lift_->ids, true, proj);
+			dB = proj - raw;
+			term_.to_reduced(dB);
+			return true;
+		}
+
+	private:
+		BarrierContactNonsmoothTerm &term_;
+	};
+
+	polysolve::nonlinear::BasisPort *BarrierContactNonsmoothTerm::basis()
+	{
+		if (!first_layer_ || opts_.lift_model != "frozen")
+			return nullptr;
+		if (!basis_port_)
+			basis_port_ = std::make_unique<LiftBasis>(*this);
+		return basis_port_.get();
+	}
 
 	// ------------------------------------------------------------------------------------------------------ dof maps
 	// The term works in the current size of the problem (cf. NLProblem::gradient / hessian): the reduced space, or the full
@@ -217,6 +415,12 @@ namespace polyfem::solver
 			f->first_derivative(xfull, gt);
 			gn += gt;
 		}
+		if (lift_exact())
+		{
+			Vec gs;
+			elastic_->subset_gradient(xfull, lift_->ids, gs);
+			gn -= gs;
+		}
 		grad = to_reduced(gn);
 		problem_.add_penalty_gradient(x, grad);
 	}
@@ -234,6 +438,21 @@ namespace polyfem::solver
 			StiffnessMatrix tmp;
 			f->second_derivative(xfull, tmp);
 			h += tmp;
+		}
+		if (lift_exact())
+		{
+			StiffnessMatrix hs;
+			elastic_->subset_hessian(xfull, lift_->ids, project_to_psd, hs);
+			h -= hs;
+		}
+		else if (first_layer_ && opts_.lift_model == "frozen_projected" && !project_to_psd && !lift_->ids.empty() && !problem_.uses_full_size())
+		{
+			// the model's quadratic has the projected block of the lifted elements
+			StiffnessMatrix raw, proj;
+			elastic_->subset_hessian(xfull, lift_->ids, false, raw);
+			elastic_->subset_hessian(xfull, lift_->ids, true, proj);
+			h += proj;
+			h -= raw;
 		}
 		to_reduced(h);
 		problem_.add_penalty_hessian(x, h);
@@ -278,7 +497,7 @@ namespace polyfem::solver
 				jdet_key_ = xf;
 			}
 		}
-		fast_validity_->min_jacobians(jdet_, problem_.reduced_to_full(y), want_min, want_ratio, min_j, min_ratio);
+		fast_validity_->min_jacobians(jdet_, problem_.reduced_to_full(y), want_min, want_ratio, min_j, min_ratio, jratio_mask_.empty() ? nullptr : &jratio_mask_);
 	}
 
 	/// Native validity shortening (cf. polysolve compute_nan_free_step_size): halve until the step is valid and the
@@ -333,9 +552,12 @@ namespace polyfem::solver
 	double BarrierContactNonsmoothTerm::value(const Vec &y)
 	{
 		const Vec yf = problem_.reduced_to_full(y);
-		if (!friction_)
-			return contact_->value(yf);
-		return contact_->value(yf) + friction_->value(yf);
+		double v = contact_->value(yf);
+		if (friction_)
+			v += friction_->value(yf);
+		if (lift_exact())
+			v += elastic_->subset_energy(yf, lift_->ids);
+		return v;
 	}
 
 	void BarrierContactNonsmoothTerm::gradient(const Vec &y, Vec &grad)
@@ -348,6 +570,12 @@ namespace polyfem::solver
 			Vec gf;
 			friction_->first_derivative(yf, gf);
 			g += gf;
+		}
+		if (lift_exact())
+		{
+			Vec ge;
+			elastic_->subset_gradient(yf, lift_->ids, ge);
+			g += ge;
 		}
 		grad = to_reduced(g);
 	}
@@ -372,6 +600,12 @@ namespace polyfem::solver
 				++b_assemblies_;
 				b_at_lag_ += at_lag;
 			}
+		}
+		if (lift_exact())
+		{
+			StiffnessMatrix Ke;
+			elastic_->subset_hessian(yf, lift_->ids, project_to_psd && opts_.lift_basis == "projected", Ke);
+			K += Ke;
 		}
 		to_reduced(K);
 		hessian = std::move(K);
@@ -439,6 +673,8 @@ namespace polyfem::solver
 				if (const int r = b.indices[j]; r >= 0)
 					grad[r] += gb[i][j];
 		}
+		if (lift_exact())
+			lift_blocks(yf, blocks, grad);
 		return true;
 	}
 

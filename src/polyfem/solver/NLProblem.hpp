@@ -13,7 +13,9 @@ namespace polysolve::linear
 
 namespace polyfem::solver
 {
-	class BarrierContactNonsmoothTerm;
+	class NonsmoothTerm;
+	class NonsmoothSession;
+	enum class EnergyChange;
 
 	class NLProblem : public FullNLProblem
 	{
@@ -100,14 +102,23 @@ namespace polyfem::solver
 
 		/// @brief Install (or remove with null) the nonsmooth term of the solves that follow: the reduced solve, or the
 		/// full-size augmented Lagrangian subproblems
-		void set_nonsmooth_term(const std::shared_ptr<BarrierContactNonsmoothTerm> &term) { nonsmooth_term_ = term; }
-		const std::shared_ptr<BarrierContactNonsmoothTerm> &nonsmooth_term() const { return nonsmooth_term_; }
+		void set_nonsmooth_term(const std::shared_ptr<NonsmoothTerm> &term) { nonsmooth_term_ = term; }
+		const std::shared_ptr<NonsmoothTerm> &nonsmooth_term() const { return nonsmooth_term_; }
+
+		/// @brief Session of the selection that outlives the terms (null: none); it hears of every energy change
+		void set_nonsmooth_session(const std::shared_ptr<NonsmoothSession> &session) { nonsmooth_session_ = session; }
+		const std::shared_ptr<NonsmoothSession> &nonsmooth_session() const { return nonsmooth_session_; }
+
+		/// @brief Called at the start of every time step (solve_tensor_nonlinear): records the step, then energy_changed(time_step)
+		void begin_time_step(const int t);
+		/// @brief The energy of the problem changed (time step, augmented Lagrangian update, friction lag)
+		void energy_changed(const EnergyChange kind);
 
 		bool has_nonsmooth_term() const override;
 		void smooth_gradient(const TVector &x, TVector &grad) override;
 		void smooth_hessian(const TVector &x, const bool project_to_psd, THessian &hessian) override;
 		double smooth_valid_fraction(const TVector &x, const TVector &a, const TVector &b) override;
-		/// @brief Element volume ratios for the Jacobian limits (BarrierContactNonsmoothTerm::min_jacobian(s)); NaN without
+		/// @brief Element volume ratios for the Jacobian limits (NonsmoothTerm::min_jacobian(s)); NaN without
 		/// a term or without the fast element validity table (all P1 tets with a NeoHookean material)
 		double smooth_min_jacobian(const TVector &x) override;
 		void smooth_min_jacobians(const TVector &x, const TVector &y, const bool want_min, const bool want_ratio, double &min_j, double &min_ratio) override;
@@ -123,6 +134,10 @@ namespace polyfem::solver
 		double nonsmooth_length_scale() override;
 		double nonsmooth_activation_distance() override;
 		void nonsmooth_segment_begin(const TVector &a, const TVector &b) override;
+		polysolve::nonlinear::FirstLayerPort *nonsmooth_first_layer() override;
+		polysolve::nonlinear::SelectionPort *nonsmooth_selection() override;
+		polysolve::nonlinear::BasisPort *nonsmooth_basis() override;
+		void nonsmooth_step_accepted(const TVector &x0, const TVector &x1) override;
 
 		virtual double grad_norm_rescaling(const polysolve::nonlinear::NormType norm_type) const override;
 		virtual double step_norm_rescaling(const polysolve::nonlinear::NormType norm_type) const override;
@@ -169,8 +184,10 @@ namespace polyfem::solver
 		std::shared_ptr<polysolve::linear::Solver> solver_;
 
 		std::shared_ptr<FullNLProblem> penalty_problem_;
-		std::shared_ptr<BarrierContactNonsmoothTerm> nonsmooth_term_;
-		BarrierContactNonsmoothTerm &term() const;
+		std::shared_ptr<NonsmoothTerm> nonsmooth_term_;
+		std::shared_ptr<NonsmoothSession> nonsmooth_session_;
+		int time_step_ = 0;
+		NonsmoothTerm &term() const;
 		int num_penalty_constraints_ = 0;
 
 		int solves_in_step_ = 0;              ///< solves (init calls) since the last init_lagging

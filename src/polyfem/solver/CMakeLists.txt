@@ -9,12 +9,25 @@ set(SOURCES
 	FastTetValidity.hpp
 	FullNLProblem.cpp
 	FullNLProblem.hpp
+	NonsmoothTerm.hpp
 	NLProblem.cpp
 	NLProblem.hpp
 	NLHomoProblem.cpp
 	NLHomoProblem.hpp
 	OperatorSplittingSolver.hpp
 	OperatorSplittingSolver.cpp
+	nonsmooth/FirstLayer.hpp
+	nonsmooth/FirstLayer.cpp
+	nonsmooth/blind/LocalTerms.hpp
+	nonsmooth/blind/LocalTerms.cpp
+	nonsmooth/blind/UnitCache.hpp
+	nonsmooth/blind/UnitCache.cpp
+	nonsmooth/blind/BlindSession.hpp
+	nonsmooth/blind/BlindSession.cpp
+	nonsmooth/blind/UnitSelector.hpp
+	nonsmooth/blind/UnitSelector.cpp
+	nonsmooth/blind/BlindUnitTerm.hpp
+	nonsmooth/blind/BlindUnitTerm.cpp
 	SolveData.cpp
 	SolveData.hpp
 )

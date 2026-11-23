@@ -102,6 +102,31 @@ namespace polyfem::solver
 		/// most recent max_step_size() call, once the step is accepted.
 		void post_step(const polysolve::nonlinear::PostStepData &data) override;
 
+		/// @brief Local derivatives of one element, same quadrature, weights and scaling (weight / scale) as the form
+		struct ElementLocal
+		{
+			std::vector<int> dofs;   ///< full dof of each local dof
+			std::vector<double> w;   ///< weight of the local dof in its full dof (x_full[dofs[j]] = w[j] * x_local[j] up to the conforming map)
+			Eigen::VectorXd g;       ///< local gradient
+			Eigen::MatrixXd H;       ///< local Hessian (unprojected), only if requested
+			double E = 0;            ///< local energy, only if requested
+		};
+
+		/// @brief True if the assembler provides local element derivatives with one full dof per local dof
+		bool supports_local() const;
+		int n_elements() const { return int(bases_.size()); }
+		/// @brief Local gradient (and Hessian, energy) of element e at x (full dofs, as a column matrix)
+		void element_local(const Eigen::MatrixXd &x, const int e, const bool with_hessian, const bool with_energy,
+						   assembler::ElementAssemblyValues &vals, ElementLocal &out) const;
+
+		/// @brief Value (weighted and scaled like the form) of the elements ids only
+		double subset_energy(const Eigen::VectorXd &x, const std::vector<int> &ids) const;
+		/// @brief Gradient (full dofs, weighted and scaled like the form) of the elements ids only
+		void subset_gradient(const Eigen::VectorXd &x, const std::vector<int> &ids, Eigen::VectorXd &grad) const;
+		/// @brief Hessian (full dofs, weighted and scaled like the form, local blocks projected to PSD as PolyFEM does if project)
+		/// of the elements ids only
+		void subset_hessian(const Eigen::VectorXd &x, const std::vector<int> &ids, const bool project, StiffnessMatrix &hessian) const;
+
 	private:
 		const int n_bases_;
 		std::vector<basis::ElementBases> &bases_;

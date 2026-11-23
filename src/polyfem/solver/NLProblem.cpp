@@ -1,6 +1,6 @@
 #include "NLProblem.hpp"
 
-#include <polyfem/solver/BarrierContactNonsmoothTerm.hpp>
+#include <polyfem/solver/NonsmoothTerm.hpp>
 #include <polyfem/solver/forms/lagrangian/BCLagrangianForm.hpp>
 
 #include <polyfem/io/OBJWriter.hpp>
@@ -556,6 +556,7 @@ namespace polyfem::solver
 	void NLProblem::init(const TVector &x)
 	{
 		FullNLProblem::init(x);
+		energy_changed(EnergyChange::unknown);
 		// solves of the time step (augmented Lagrangian subproblems, the reduced solve, the re-solves of the lagging loop)
 		++solves_in_step_;
 		friction_b_lag_pending_ = solves_in_step_ == 1;
@@ -886,13 +887,25 @@ namespace polyfem::solver
 	}
 
 	// ------------------------------------------------------------------------------------------------ nonsmooth term
+	void NLProblem::begin_time_step(const int t)
+	{
+		time_step_ = t;
+		energy_changed(EnergyChange::time_step);
+	}
+
+	void NLProblem::energy_changed(const EnergyChange kind)
+	{
+		if (nonsmooth_session_)
+			nonsmooth_session_->begin_epoch(kind, time_step_);
+	}
+
 	bool NLProblem::has_nonsmooth_term() const
 	{
 		// the caller installs the term only around the solves that use it (BarrierContactNonsmoothTerm handles both sizes)
 		return nonsmooth_term_ != nullptr;
 	}
 
-	BarrierContactNonsmoothTerm &NLProblem::term() const
+	NonsmoothTerm &NLProblem::term() const
 	{
 		if (!has_nonsmooth_term())
 			log_and_throw_error("NLProblem: no nonsmooth term installed");
@@ -929,4 +942,13 @@ namespace polyfem::solver
 	double NLProblem::nonsmooth_length_scale() { return term().length_scale(); }
 	double NLProblem::nonsmooth_activation_distance() { return term().activation_distance(); }
 	void NLProblem::nonsmooth_segment_begin(const TVector &a, const TVector &b) { term().segment_begin(a, b); }
+
+	polysolve::nonlinear::FirstLayerPort *NLProblem::nonsmooth_first_layer() { return nonsmooth_term_ ? nonsmooth_term_->first_layer() : nullptr; }
+	polysolve::nonlinear::SelectionPort *NLProblem::nonsmooth_selection() { return nonsmooth_term_ ? nonsmooth_term_->selection() : nullptr; }
+	polysolve::nonlinear::BasisPort *NLProblem::nonsmooth_basis() { return nonsmooth_term_ ? nonsmooth_term_->basis() : nullptr; }
+	void NLProblem::nonsmooth_step_accepted(const TVector &x0, const TVector &x1)
+	{
+		if (nonsmooth_term_)
+			nonsmooth_term_->step_accepted(x0, x1);
+	}
 } // namespace polyfem::solver

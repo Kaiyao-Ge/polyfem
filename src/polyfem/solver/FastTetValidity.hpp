@@ -54,8 +54,11 @@ namespace polyfem::solver
 		/// @brief In one sweep over the tets at the full displacement yf: the smallest J (if want_min, as min_jacobian(yf))
 		/// and the smallest ratio det D(yf) / det_x of a tet's determinant to its entry of det_x = dets(xf) (if want_ratio,
 		/// the smallest J_e(yf) / J_e(xf)); NaN where not requested
+		/// @param ratio_mask null: all tets count for the ratio; else only the tets with a nonzero entry
 		void min_jacobians(const Eigen::VectorXd &det_x, const Eigen::VectorXd &yf, const bool want_min, const bool want_ratio,
-						   double &min_j, double &min_ratio) const;
+						   double &min_j, double &min_ratio, const std::vector<char> *ratio_mask = nullptr) const;
+		/// @brief J = det D(yf) / det D(0) and the ratio det D(yf) / det_x of every tet
+		void jacobian_arrays(const Eigen::VectorXd &det_x, const Eigen::VectorXd &yf, std::vector<double> &J, std::vector<double> &ratio) const;
 
 	private:
 		double tet_det(int e, const Eigen::VectorXd &uf) const;

@@ -1,5 +1,6 @@
 #include "Assembler.hpp"
 #include "MatParams.hpp"
+#include "LocalCapture.hpp"
 
 #include <polyfem/utils/Logger.hpp>
 #include <polyfem/utils/MaybeParallelFor.hpp>
@@ -1033,6 +1034,7 @@ namespace polyfem::assembler
 		rhs.resize(n_basis * size(), 1);
 		rhs.setZero();
 
+		LocalCapture *const capture = local_capture(); // the local gradients are kept if a capture is installed
 		auto storage = create_thread_storage(LocalThreadVecStorage(rhs.size()));
 
 		const int n_bases = int(bases.size());
@@ -1056,6 +1058,14 @@ namespace polyfem::assembler
 
 				const auto val = assemble_gradient(NonLinearAssemblerData(vals, t, dt, displacement, displacement_prev, local_storage.da));
 				assert(val.size() == n_loc_bases * size());
+
+				if (capture != nullptr && capture->g != nullptr)
+				{
+					if (val.size() == LocalCapture::NLOC && e < capture->n)
+						Eigen::Map<Eigen::VectorXd>(capture->g + std::size_t(e) * LocalCapture::NLOC, LocalCapture::NLOC) = val;
+					else
+						++capture->bad;
+				}
 
 				for (int j = 0; j < n_loc_bases; ++j)
 				{
@@ -1113,6 +1123,7 @@ namespace polyfem::assembler
 		mat_cache.init(n_basis * size());
 		mat_cache.set_zero();
 
+		LocalCapture *const capture_h = local_capture(); // the local Hessians (before the projection) are kept if a capture is installed
 		auto storage = create_thread_storage(LocalThreadMatStorage(buffer_size, mat_cache));
 
 		const int n_bases = int(bases.size());
@@ -1145,6 +1156,14 @@ namespace polyfem::assembler
 				auto stiffness_val = assemble_hessian(NonLinearAssemblerData(vals, t, dt, displacement, displacement_prev, da));
 				assert(stiffness_val.rows() == n_loc_bases * size());
 				assert(stiffness_val.cols() == n_loc_bases * size());
+
+				if (capture_h != nullptr && capture_h->H != nullptr)
+				{
+					if (stiffness_val.rows() == LocalCapture::NLOC && stiffness_val.cols() == LocalCapture::NLOC && e < capture_h->n)
+						Eigen::Map<Eigen::Matrix<double, LocalCapture::NLOC, LocalCapture::NLOC>>(capture_h->H + std::size_t(e) * LocalCapture::NLOC * LocalCapture::NLOC) = stiffness_val;
+					else
+						++capture_h->bad;
+				}
 
 				if (project_to_psd)
 					stiffness_val = ipc::project_to_psd(stiffness_val);

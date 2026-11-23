@@ -73,6 +73,7 @@ namespace polyfem::solver
 		constexpr double cert_c = 0.8;
 		const Eigen::VectorXd f0 = problem_.reduced_to_full(x0), f1 = problem_.reduced_to_full(x1);
 		double step = 1;
+		limit_family = -1;
 		for (auto &f : other_)
 			if (f->enabled())
 				step = std::min(step, f->max_step_size(f0, f1));
@@ -122,6 +123,7 @@ namespace polyfem::solver
 		// the certified candidates: the edge-edge and face-vertex candidates not left for Tight Inclusion
 		n_certified += long(std::count(to_ti.begin() + begin_ee, to_ti.begin() + end_fv, char(0)));
 		// Tight Inclusion in candidate order, each with the earliest time of impact so far as its tmax
+		size_t limit_i = nC;
 		for (size_t i = 0; i < nC; ++i)
 		{
 			if (!to_ti[i])
@@ -131,7 +133,21 @@ namespace polyfem::solver
 			double toi = 1;
 			++n_ti;
 			if (s.ccd(xa, xb, toi, 0.0, earliest, ti))
+			{
+				if (toi < earliest)
+					limit_i = i;
 				earliest = std::min(earliest, toi);
+			}
+		}
+		if (limit_i < nC && earliest <= step && limit_i < end_fv)
+		{
+			// the pair that limits the step (identified before the dedupe removes candidates)
+			const ipc::CollisionStencil &s = C[limit_i];
+			limit_family = limit_i < C.vv_candidates.size() ? 0 : limit_i < begin_ee ? 1 : limit_i < begin_fv ? 2 : 3;
+			const auto vis = s.vertex_ids(E, Fc);
+			const int nv = s.num_vertices();
+			for (int a = 0; a < 4; ++a)
+				limit_vis[a] = a < nv ? int(vis[a]) : -1;
 		}
 		if (dedupe_)
 		{
