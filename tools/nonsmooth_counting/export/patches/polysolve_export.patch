@@ -1,0 +1,1440 @@
+diff -ruN ps_orig/src/polysolve/ClExport.hpp ps/src/polysolve/ClExport.hpp
+--- ps_orig/src/polysolve/ClExport.hpp	1969-12-31 19:00:00.000000000 -0500
++++ ps/src/polysolve/ClExport.hpp	2026-11-23 13:00:34.866354669 -0500
+@@ -0,0 +1,298 @@
++#pragma once
++
++// EXPORT BUILD ONLY (tools/nonsmooth_counting/export): counting and export hooks of the external counting tool
++// (tools/nonsmooth_counting/counting/README.md). Not part of the production code.
++//
++// Switches (environment variables; unset: nothing is written, nothing is computed beyond one branch on a static flag):
++//   POLYFEM_CL_COUNTS=<dir>   <dir>/cl_counts.jsonl: one JSON row per factorization ("fact"), outer iteration ("outer"), accepted point ("point"),
++//                             CCD or collision-set call ("ccd"), and solve ("solve"); formats as joint/cl/interfaces.md section 1, see README.md
++//   POLYFEM_CL_EXPORT=<dir>   <dir>/index.tsv and the .bin files of joint/cl/interfaces.md section 2 (fact, blocks, elem, surf, ccdmesh) plus tiq
++//                             (the narrow-phase queries that the solver handed to Tight Inclusion, CLTIQ001)
++// Neither switch changes a number of the solve.
++//
++// The selection of the exported items is made on line with files that are deleted again when an item drops out, so that the disk holds at most the
++// selected set (plus one rolling "last" item per group):
++//   fact:    the first primary factorization of every outer, thinned to 20 (uniform, the stride doubles when the list is full); every failed factorization (thinned to 4)
++//   blocks / elem: of the accepted points 8 uniform (stride doubling, the first kept) + the last point (a rolling slot) + the 2 points with the most new blocks
++//   surf:    CCD calls 12 uniform + the last; collision-set builds 8 uniform + the last; the TI queries (tiq) belong to the item of their CCD call
++//   ccdmesh: once.
++// The same decision serves all files of a point (blocks and elem) or of a call (surf and tiq). index.tsv is written when the process ends.
++
++#include <polysolve/Types.hpp>
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <ctime>
++#include <filesystem>
++#include <fstream>
++#include <list>
++#include <map>
++#include <string>
++#include <vector>
++
++namespace polysolve::cl
++{
++    struct Ctx
++    {
++        bool on = false;
++        std::string dir;
++        std::FILE *f = nullptr;
++        // context of the rows (set by the strategy, read by the problem)
++        long step = 0;  ///< minimize (solve) counter, 1-based: the index of the entry of solver_info
++        long outer = 0; ///< iteration of this minimize that the strategy has been asked for, 1-based
++        long point = 0; ///< global accepted-point counter (every build of the reduced matrix)
++        const int *inner_ptr = nullptr; ///< accepted inner steps of the running path
++        bool blind = false;
++        long ccd_seq = 0, fact_seq = 0;
++        std::string fact_kind = "other";
++        long fact_in_outer = 0;
++        bool chain_analyzed = false; ///< the last Newton::analyze_pattern did the symbolic analysis
++        long long chain_an_ns = 0;
++        double last_lnz = -1; ///< lnz of the last factorization row
++        Ctx()
++        {
++            const char *d = std::getenv("POLYFEM_CL_COUNTS");
++            if (d == nullptr || d[0] == '\0')
++                return;
++            dir = d;
++            std::filesystem::create_directories(dir);
++            f = std::fopen((dir + "/cl_counts.jsonl").c_str(), "wb");
++            on = f != nullptr;
++        }
++        ~Ctx()
++        {
++            if (f != nullptr)
++                std::fclose(f);
++        }
++    };
++
++    inline Ctx &ctx()
++    {
++        static Ctx c;
++        return c;
++    }
++
++    inline bool on() { return ctx().on; }
++
++    inline void put(const json &j)
++    {
++        Ctx &c = ctx();
++        if (!c.on)
++            return;
++        const std::string s = j.dump() + "\n";
++        std::fwrite(s.data(), 1, s.size(), c.f);
++    }
++
++    /// thread CPU time, nanoseconds
++    inline long long cpu_ns()
++    {
++        timespec ts;
++        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
++        return (long long)ts.tv_sec * 1000000000LL + (long long)ts.tv_nsec;
++    }
++
++    // ------------------------------------------------------------------------------------------------------------------ the replay exports
++    struct ExportSub
++    {
++        std::string type, kind = "-", file, id;
++        long step = -1, outer = -1, point = -1, success = -1, minor = -1, n = -1, nnz = -1;
++        long long solver_ns = 0;
++        std::string extra = "-";
++    };
++    struct ExportItem
++    {
++        long idx = 0;
++        int roles = 0; ///< 1 uniform, 2 last, 4 top (new blocks)
++        long newb = 0;
++        long seq = 0;
++        std::vector<ExportSub> subs;
++    };
++    struct ExportGroup
++    {
++        size_t cap = 8, ntop = 0;
++        bool last = true;
++        long stride = 1, counter = 0;
++        std::list<ExportItem> items;
++    };
++    struct Export
++    {
++        bool on = false;
++        std::string dir;
++        long seq = 0;
++        std::map<std::string, ExportGroup> groups;
++        bool mesh_done = false;
++        Export()
++        {
++            const char *d = std::getenv("POLYFEM_CL_EXPORT");
++            if (d == nullptr || d[0] == '\0')
++                return;
++            dir = d;
++            std::filesystem::create_directories(dir);
++            on = true;
++            groups["fact"].cap = 20;
++            groups["fact"].last = false;
++            groups["factfail"].cap = 4;
++            groups["factfail"].last = false;
++            groups["blocks"].cap = 8;
++            groups["blocks"].ntop = 2;
++            groups["surf_ccd"].cap = 12;
++            groups["surf_coll"].cap = 8;
++        }
++        static void drop_files(const std::string &dir, ExportItem &it)
++        {
++            for (const ExportSub &s : it.subs)
++            {
++                std::error_code ec;
++                std::filesystem::remove(dir + "/" + s.file, ec);
++            }
++        }
++        void release(ExportGroup &G, std::list<ExportItem>::iterator it, const int role)
++        {
++            it->roles &= ~role;
++            if (it->roles == 0)
++            {
++                drop_files(dir, *it);
++                G.items.erase(it);
++            }
++        }
++        /// the decision for the next candidate of a group; nullptr: not selected. newb: the number of new blocks (ranks the top slots). The caller adds the sub files (sub()).
++        ExportItem *offer(const std::string &group, const long newb = 0)
++        {
++            if (!on)
++                return nullptr;
++            ExportGroup &G = groups[group];
++            const long i = G.counter++;
++            int roles = 0;
++            if (i % G.stride == 0)
++                roles |= 1;
++            if (G.ntop > 0 && newb > 0)
++            {
++                size_t nt = 0;
++                std::list<ExportItem>::iterator mn = G.items.end();
++                for (auto it = G.items.begin(); it != G.items.end(); ++it)
++                    if (it->roles & 4)
++                    {
++                        ++nt;
++                        if (mn == G.items.end() || it->newb < mn->newb)
++                            mn = it;
++                    }
++                if (nt < G.ntop)
++                    roles |= 4;
++                else if (newb > mn->newb)
++                {
++                    release(G, mn, 4);
++                    roles |= 4;
++                }
++            }
++            if (G.last)
++            {
++                for (auto it = G.items.begin(); it != G.items.end();)
++                {
++                    auto nx = std::next(it);
++                    if (it->roles & 2)
++                        release(G, it, 2);
++                    it = nx;
++                }
++                if (roles == 0)
++                    roles |= 2;
++            }
++            if (roles == 0)
++                return nullptr;
++            ExportItem item;
++            item.idx = i;
++            item.roles = roles;
++            item.newb = newb;
++            item.seq = seq++;
++            G.items.push_back(item);
++            size_t nu = 0;
++            for (const ExportItem &x : G.items)
++                nu += (x.roles & 1) ? 1 : 0;
++            if (nu > G.cap)
++            {
++                G.stride *= 2;
++                for (auto it = G.items.begin(); it != G.items.end();)
++                {
++                    auto nx = std::next(it);
++                    if ((it->roles & 1) && it->idx % G.stride != 0)
++                        release(G, it, 1);
++                    it = nx;
++                }
++            }
++            for (auto it = G.items.begin(); it != G.items.end(); ++it)
++                if (it->seq == item.seq)
++                    return &*it;
++            return nullptr;
++        }
++        /// adds a file to an item, names it <type>_<seq>.bin and returns the sub (the caller fills the meta data) and the path
++        ExportSub &sub(ExportItem &it, const std::string &type, std::string &path)
++        {
++            ExportSub s;
++            s.type = type;
++            s.id = type + "_" + std::to_string(it.seq);
++            s.file = s.id + ".bin";
++            it.subs.push_back(s);
++            path = dir + "/" + s.file;
++            return it.subs.back();
++        }
++        ~Export()
++        {
++            if (!on)
++                return;
++            std::vector<std::pair<long, const ExportSub *>> ord;
++            for (const auto &[name, G] : groups)
++                for (const ExportItem &it : G.items)
++                    for (const ExportSub &s : it.subs)
++                        ord.emplace_back(it.seq * 8 + long(&s - &it.subs[0]), &s);
++            ExportSub m;
++            if (mesh_done)
++            {
++                m.type = "ccdmesh";
++                m.id = "ccdmesh";
++                m.file = "ccdmesh.bin";
++                ord.emplace_back(-1, &m);
++            }
++            std::sort(ord.begin(), ord.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
++            std::ofstream f(dir + "/index.tsv");
++            f << "id\tfile\ttype\tstep\touter\tpoint\tkind\tsuccess\tminor\tn\tnnz\textra\tsolver_cpu_ns\n";
++            for (const auto &[o, s] : ord)
++                f << s->id << '\t' << s->file << '\t' << s->type << '\t' << s->step << '\t' << s->outer << '\t' << s->point << '\t' << s->kind << '\t' << s->success << '\t' << s->minor << '\t' << s->n << '\t' << s->nnz << '\t' << s->extra << '\t' << s->solver_ns << '\n';
++        }
++    };
++    inline Export &exporter()
++    {
++        static Export e;
++        return e;
++    }
++    inline bool xon() { return exporter().on; }
++    /// either switch is set
++    inline bool any() { return on() || xon(); }
++
++    /// one narrow-phase query that the solver handed to Tight Inclusion (CLTIQ001): the family (0 vertex-vertex, 1 edge-vertex, 2 edge-edge, 3 face-vertex), the
++    /// positions of its 2 / 3 / 4 / 4 vertices at the start (xa) and the end (xb) of the segment (3 numbers each, in the order of the stencil) and the tmax it was given
++    struct TiQuery
++    {
++        int family = 0, nv = 0;
++        double tmax = 1;
++        double xa[12], xb[12];
++    };
++
++    /// binary writer helpers (little endian, as on the host)
++    struct BinOut
++    {
++        std::FILE *f = nullptr;
++        explicit BinOut(const std::string &path) : f(std::fopen(path.c_str(), "wb")) {}
++        ~BinOut()
++        {
++            if (f != nullptr)
++                std::fclose(f);
++        }
++        bool ok() const { return f != nullptr; }
++        void magic(const char *m) { std::fwrite(m, 1, 8, f); }
++        void i64(const long long v) { std::fwrite(&v, sizeof v, 1, f); }
++        void i32(const int v) { std::fwrite(&v, sizeof v, 1, f); }
++        void f64(const double v) { std::fwrite(&v, sizeof v, 1, f); }
++        void i32v(const int *p, const size_t n) { std::fwrite(p, sizeof(int), n, f); }
++        void f64v(const double *p, const size_t n) { std::fwrite(p, sizeof(double), n, f); }
++    };
++} // namespace polysolve::cl
+diff -ruN ps_orig/src/polysolve/ClTime.hpp ps/src/polysolve/ClTime.hpp
+--- ps_orig/src/polysolve/ClTime.hpp	1969-12-31 19:00:00.000000000 -0500
++++ ps/src/polysolve/ClTime.hpp	2026-11-23 15:34:01.300352249 -0500
+@@ -0,0 +1,133 @@
++#pragma once
++
++// EXPORT BUILD ONLY (tools/nonsmooth_counting/export): exclusive thread-CPU timers by category, to see which part of a solve is priced by which cost item
++// (tools/nonsmooth_counting/counting/README.md) and to check the estimate against a measurement. Header only, enabled by POLYFEM_CL_COUNTS.
++//
++// A Scope("name", units) measures the thread CPU time between its construction and destruction, minus the time of the scopes nested inside it (exclusive time), and adds it
++// to the category "name" together with the number of calls and the work units of the calls. The measurement is only a check of the unit prices; the prices themselves come from
++// isolated replays and micro-benchmarks (counting/replay, and the bench epilogue of the export build).
++// Per minimize (one solve) the strategy writes one row {"t":"cats","step","total_cpu_ns","cats":{name:{ns,calls,units}}} and clears the table.
++
++#include <polysolve/ClExport.hpp>
++
++#include <map>
++#include <string>
++#include <vector>
++
++namespace polysolve::cl
++{
++    struct CatStat
++    {
++        double ns = 0, units = 0;
++        long calls = 0;
++    };
++
++    struct Timers
++    {
++        struct Frame
++        {
++            long long t0 = 0, child = 0;
++            const char *name = nullptr;
++            std::string dyn; ///< the name when it was built at run time
++            double units = 0;
++        };
++        std::map<std::string, CatStat> table;
++        std::vector<Frame> stack;
++        bool on = false;
++        long long solve_t0 = 0;
++        Timers() { on = std::getenv("POLYFEM_CL_COUNTS") != nullptr && std::getenv("POLYFEM_CL_COUNTS")[0] != '\0' && std::getenv("POLYFEM_CL_NOTIMERS") == nullptr; }
++    };
++
++    inline Timers &timers()
++    {
++        static Timers t;
++        return t;
++    }
++
++    /// the projection setting of the Hessian assembly in progress (the categories of the projected and the raw assembly are priced apart)
++    inline bool &proj_flag()
++    {
++        static bool p = false;
++        return p;
++    }
++
++    struct Scope
++    {
++        bool active = false;
++        explicit Scope(const char *name, const double units = 0)
++        {
++            Timers &T = timers();
++            if (!T.on)
++                return;
++            active = true;
++            T.stack.emplace_back();
++            Timers::Frame &f = T.stack.back();
++            f.name = name;
++            f.units = units;
++            f.t0 = cpu_ns();
++        }
++        Scope(const std::string &name, const double units)
++        {
++            Timers &T = timers();
++            if (!T.on)
++                return;
++            active = true;
++            T.stack.emplace_back();
++            Timers::Frame &f = T.stack.back();
++            f.dyn = name;
++            f.units = units;
++            f.t0 = cpu_ns();
++        }
++        /// work units that are only known inside the scope
++        void add_units(const double u)
++        {
++            if (active)
++                timers().stack.back().units += u;
++        }
++        ~Scope()
++        {
++            if (!active)
++                return;
++            Timers &T = timers();
++            const long long now = cpu_ns();
++            Timers::Frame f = std::move(T.stack.back());
++            T.stack.pop_back();
++            const long long total = now - f.t0;
++            CatStat &c = T.table[f.name != nullptr ? std::string(f.name) : f.dyn];
++            c.ns += double(total - f.child);
++            c.calls += 1;
++            c.units += f.units;
++            if (!T.stack.empty())
++                T.stack.back().child += total;
++        }
++        Scope(const Scope &) = delete;
++        Scope &operator=(const Scope &) = delete;
++    };
++
++    /// one solve: start / end (writes the row of the categories)
++    struct SolveScope
++    {
++        SolveScope()
++        {
++            Timers &T = timers();
++            if (T.on)
++            {
++                T.table.clear();
++                T.stack.clear();
++                T.solve_t0 = cpu_ns();
++            }
++        }
++        ~SolveScope()
++        {
++            Timers &T = timers();
++            if (!T.on)
++                return;
++            json cats = json::object();
++            for (const auto &kv : T.table)
++                cats[kv.first] = {{"ns", kv.second.ns}, {"calls", kv.second.calls}, {"units", kv.second.units}};
++            put({{"t", "cats"}, {"step", ctx().step}, {"total_cpu_ns", cpu_ns() - T.solve_t0}, {"cats", cats}});
++            T.table.clear();
++            T.stack.clear();
++        }
++    };
++} // namespace polysolve::cl
+diff -ruN ps_orig/src/polysolve/linear/Solver.cpp ps/src/polysolve/linear/Solver.cpp
+--- ps_orig/src/polysolve/linear/Solver.cpp	2026-11-23 11:51:17.898102767 -0500
++++ ps/src/polysolve/linear/Solver.cpp	2026-11-23 12:57:20.230157736 -0500
+@@ -288,6 +288,33 @@
+                 index = long(static_cast<const int *>(L->Perm)[L->minor]);
+                 return true;
+             }
++            bool factor_stats(double &flops, double &lnz, double &minor, double &n, double &flops_done, double &perm_minor) const override
++            {
++                const CholAccess &a = static_cast<const CholAccess &>(m_Solver);
++                const cholmod_factor *L = a.fac();
++                if (L == nullptr)
++                    return false;
++                cholmod_common &cm = const_cast<CholAccess &>(a).cholmod();
++                flops = cm.fl;
++                lnz = cm.lnz;
++                minor = double(L->minor);
++                n = double(L->n);
++                flops_done = flops;
++                perm_minor = (L->minor < L->n && L->Perm != nullptr) ? double(static_cast<const int *>(L->Perm)[L->minor]) : -1.0;
++                if (L->minor < L->n)
++                {
++                    flops_done = -1;
++                    if (L->ColCount != nullptr)
++                    {
++                        double s = 0;
++                        const int *cc = static_cast<const int *>(L->ColCount);
++                        for (size_t j = 0; j < size_t(L->minor); ++j)
++                            s += double(cc[j]) * double(cc[j]);
++                        flops_done = s;
++                    }
++                }
++                return true;
++            }
+         };
+     } // namespace
+ #endif
+diff -ruN ps_orig/src/polysolve/linear/Solver.hpp ps/src/polysolve/linear/Solver.hpp
+--- ps_orig/src/polysolve/linear/Solver.hpp	2026-11-23 11:51:17.897318998 -0500
++++ ps/src/polysolve/linear/Solver.hpp	2026-11-23 12:57:20.229799700 -0500
+@@ -136,6 +136,11 @@
+         /// definite (supported by Eigen::CholmodSupernodalLLT); false if there was no such failure or the solver does not report it
+         virtual bool failure_pivot(long &index) const { return false; }
+ 
++        /// @brief EXPORT BUILD: statistics of the last numeric factorization of a CHOLMOD solver: the flop count and the nonzeros of L of its last
++        /// symbolic analysis, the column at which the numeric factorization stopped (n on success), n, the flops done before the stop (sum over the
++        /// columns before `minor` of ColCount^2; -1 if CHOLMOD does not give the column counts) and the unknown at which it stopped; false if the solver does not report them
++        virtual bool factor_stats(double &flops, double &lnz, double &minor, double &n, double &flops_done, double &perm_minor) const { return false; }
++
+         /// @brief Name of the solver type (for debugging purposes)
+         virtual std::string name() const { return ""; }
+     };
+diff -ruN ps_orig/src/polysolve/nonlinear/ClFact.hpp ps/src/polysolve/nonlinear/ClFact.hpp
+--- ps_orig/src/polysolve/nonlinear/ClFact.hpp	1969-12-31 19:00:00.000000000 -0500
++++ ps/src/polysolve/nonlinear/ClFact.hpp	2026-11-23 15:26:41.728053210 -0500
+@@ -0,0 +1,77 @@
++#pragma once
++
++// EXPORT BUILD ONLY: the row and the replay export (CLFACT01) of one factorization; see polysolve/ClExport.hpp.
++
++#include <polysolve/ClExport.hpp>
++#include <polysolve/ClTime.hpp>
++#include <polysolve/linear/Solver.hpp>
++
++namespace polysolve::cl
++{
++    /// the replay export of a factorization (CLFACT01): the matrix as handed to the solver
++    inline void export_fact(const StiffnessMatrix &H, const bool ok, const bool analyzed, const long minor, const double perm_minor, const long long factor_ns, const std::string &kind)
++    {
++        Export &ex = exporter();
++        ExportItem *it = ex.offer(ok ? "fact" : "factfail");
++        if (it == nullptr)
++            return;
++        std::string path;
++        ExportSub &s = ex.sub(*it, "fact", path);
++        const Ctx &c = ctx();
++        s.kind = kind;
++        s.step = c.step;
++        s.outer = c.outer;
++        s.point = c.point;
++        s.success = ok ? 1 : 0;
++        s.minor = minor;
++        s.n = long(H.rows());
++        s.nnz = long(H.nonZeros());
++        s.extra = analyzed ? "pattern_changed" : "-";
++        s.solver_ns = factor_ns;
++        StiffnessMatrix Hc = H;
++        Hc.makeCompressed();
++        BinOut o(path);
++        if (!o.ok())
++            return;
++        o.magic("CLFACT01");
++        o.i64(Hc.rows());
++        o.i64(Hc.nonZeros());
++        o.i64(ok ? (long long)Hc.rows() : (long long)minor);
++        o.i64(ok ? 1 : 0);
++        o.i64(ok ? -1 : (long long)perm_minor);
++        o.i32v(Hc.outerIndexPtr(), size_t(Hc.cols()) + 1);
++        o.i32v(Hc.innerIndexPtr(), size_t(Hc.nonZeros()));
++        o.f64v(Hc.valuePtr(), size_t(Hc.nonZeros()));
++    }
++
++    /// the row of one factorization (called after the numeric factorization with the solver that did it). kind: primary, retry_proj, repair, chain
++    inline void fact_row(const linear::Solver &lin, const StiffnessMatrix &H, const bool analyzed, const bool ok, const long long analyze_ns, const long long factor_ns, const std::string &kind)
++    {
++        Scope cl_hook("X.hook");
++        Ctx &c = ctx();
++        double fl = 0, lnz = 0, minor = 0, nn = 0, fl_done = -1, perm_minor = -1;
++        const bool have = lin.factor_stats(fl, lnz, minor, nn, fl_done, perm_minor);
++        json r = {{"t", "fact"}, {"step", c.step}, {"outer", c.outer}, {"seq", c.fact_seq++}, {"kind", kind}, {"pattern_changed", analyzed}, {"n", long(H.rows())}, {"nnz", long(H.nonZeros())},
++                  {"success", ok}, {"analyze_cpu_ns", analyze_ns}, {"factor_cpu_ns", factor_ns}};
++        if (have)
++        {
++            r["fl"] = fl;
++            r["lnz"] = lnz;
++            r["minor"] = long(minor);
++            r["fl_done"] = ok ? fl : fl_done;
++        }
++        else
++        {
++            r["fl"] = -1;
++            r["lnz"] = -1;
++            r["minor"] = ok ? long(H.rows()) : -1L;
++            r["fl_done"] = -1;
++        }
++        c.last_lnz = lnz;
++        put(r);
++        if (xon() && (!ok || (kind == "primary" && c.fact_in_outer == 0)))
++            export_fact(H, ok, analyzed, r["minor"].get<long>(), perm_minor, factor_ns, kind);
++        if (ok || kind == "primary")
++            ++c.fact_in_outer;
++    }
++} // namespace polysolve::cl
+diff -ruN ps_orig/src/polysolve/nonlinear/Problem.hpp ps/src/polysolve/nonlinear/Problem.hpp
+--- ps_orig/src/polysolve/nonlinear/Problem.hpp	2026-11-22 21:05:17.574780178 -0500
++++ ps/src/polysolve/nonlinear/Problem.hpp	2026-11-23 12:58:13.416435932 -0500
+@@ -259,6 +259,14 @@
+         virtual BasisPort *nonsmooth_basis() { return nullptr; }
+         virtual LogPort *nonsmooth_log() { return nullptr; }
+ 
++        // EXPORT BUILD (tools/nonsmooth_counting/export): the counting and export hooks of the nonsmooth term
++        /// @brief The kind of each block that nonsmooth_hessian_blocks gave last: 0 elastic element, 1 edge-edge, 2 face-vertex, 3 edge-vertex, 4 vertex-vertex, 5 other (friction)
++        virtual bool nonsmooth_cl_block_kinds(std::vector<int> &kinds) { return false; }
++        /// @brief Writes the exact elastic elements at y (CLELM001) to file; their number, or -1 if there is none or no closed-form kernel
++        virtual long nonsmooth_cl_export_elem(const TVector &y, const std::string &file, const long step, const long outer, const long point) { return -1; }
++        /// @brief Writes the collision mesh (CLCMSH01) to file
++        virtual bool nonsmooth_cl_export_mesh(const std::string &file) { return false; }
++
+         /// @brief The solver accepted the step x0 -> x1 (called after the update of the solution).
+         virtual void nonsmooth_step_accepted(const TVector &x0, const TVector &x1) {}
+ 
+diff -ruN ps_orig/src/polysolve/nonlinear/Solver.cpp ps/src/polysolve/nonlinear/Solver.cpp
+--- ps_orig/src/polysolve/nonlinear/Solver.cpp	2026-11-22 23:52:53.674810367 -0500
++++ ps/src/polysolve/nonlinear/Solver.cpp	2026-11-23 15:22:05.249602981 -0500
+@@ -1,5 +1,6 @@
+ 
+ #include "Solver.hpp"
++#include <polysolve/ClTime.hpp> // export build
+ 
+ #include "PostStepData.hpp"
+ 
+@@ -278,6 +279,7 @@
+     void Solver::minimize(Problem &objFunc, TVector &x)
+     {
+         constexpr double NaN = std::numeric_limits<double>::quiet_NaN();
++        cl::SolveScope cl_solve; // export build: the thread CPU time of this solve and its categories
+ 
+         reset_stopping_criteria(objFunc, m_norm_type);
+ 
+@@ -302,13 +304,18 @@
+         } chain_step;
+         {
+             POLYSOLVE_SCOPED_STOPWATCH("constraint set update", constraint_set_update_time, m_logger);
++            cl::Scope cl_s("S.solution_changed");
+             objFunc.solution_changed(x);
+         }
+ 
+         StopWatch stop_watch("nonlinear solver", total_time, m_logger);
+         stop_watch.start();
+ 
+-        const double f_start = objFunc(x);
++        double f_start;
++        {
++            cl::Scope cl_s("S.energy");
++            f_start = objFunc(x);
++        }
+         m_logger.debug(
+             "Starting {} with {} solve {}={:g} (stopping criteria: {})",
+             descent_strategy_name(), m_line_search->name(), log::f0(), f_start, m_stop_rescaled.print_message());
+@@ -328,6 +335,7 @@
+             double energy;
+             {
+                 POLYSOLVE_SCOPED_STOPWATCH("compute objective function", obj_fun_time, m_logger);
++                cl::Scope cl_s("S.energy");
+                 energy = objFunc(x);
+             }
+             m_current.energy = energy;
+@@ -344,11 +352,13 @@
+             // --- Gradient ----------------------------------------------------
+             {
+                 POLYSOLVE_SCOPED_STOPWATCH("compute gradient", grad_time, m_logger);
++                cl::Scope cl_s("S.gradient");
+                 objFunc.gradient(x, grad);
+             }
+ 
+             {
+                 POLYSOLVE_SCOPED_STOPWATCH("verify gradient", grad_time, m_logger);
++                cl::Scope cl_s("S.verify_gradient");
+                 verify_gradient(objFunc, x, grad);
+             }
+ 
+@@ -390,6 +400,7 @@
+             bool update_direction_successful;
+             {
+                 POLYSOLVE_SCOPED_STOPWATCH("compute update direction", update_direction_time, m_logger);
++                cl::Scope cl_s("S.direction");
+                 update_direction_successful = compute_update_direction(objFunc, x, grad, delta_x);
+             }
+ 
+@@ -511,6 +522,7 @@
+             bool use_own_step;
+             {
+                 POLYSOLVE_SCOPED_STOPWATCH("line search", line_search_time, m_logger);
++                cl::Scope cl_s("S.step");
+                 // a strategy's own step would bypass the direction filter, so it is only used without one
+                 use_own_step = !m_direction_filter && m_strategies[m_descent_strategy]->take_step(objFunc, x, energy, grad, delta_x, own_step);
+                 if (!use_own_step)
+@@ -536,6 +548,7 @@
+             }
+ 
+             {
++                cl::Scope cl_s("S.accept");
+                 TVector x1 = use_own_step ? TVector(x + own_step) : TVector(x + rate * delta_x);
+                 if (use_own_step)
+                     objFunc.solution_changed(x1); // a line search leaves the problem at its accepted point
+@@ -581,8 +594,11 @@
+             // m_logger.debug("[{}][{}] rate={:g} ‖step‖={:g}",
+             //                descent_strategy_name(), m_line_search->name(), rate, step);
+ 
+-            update_solver_info(energy);
+-            objFunc.post_step(PostStepData(m_current.iterations, solver_info, x, grad));
++            {
++                cl::Scope cl_s("S.post_step");
++                update_solver_info(energy);
++                objFunc.post_step(PostStepData(m_current.iterations, solver_info, x, grad));
++            }
+ 
+             if (objFunc.stop(x))
+             {
+@@ -627,7 +643,10 @@
+             m_current.print_message(), m_stop_rescaled.print_message());
+ 
+         log_times();
+-        update_solver_info(objFunc(x));
++        {
++            cl::Scope cl_s("S.energy");
++            update_solver_info(objFunc(x));
++        }
+     }
+ 
+     void Solver::reset(const int ndof)
+diff -ruN ps_orig/src/polysolve/nonlinear/descent_strategies/Newton.cpp ps/src/polysolve/nonlinear/descent_strategies/Newton.cpp
+--- ps_orig/src/polysolve/nonlinear/descent_strategies/Newton.cpp	2026-11-13 14:19:44.939104018 -0500
++++ ps/src/polysolve/nonlinear/descent_strategies/Newton.cpp	2026-11-23 15:34:01.309908663 -0500
+@@ -1,6 +1,8 @@
+ #include "Newton.hpp"
+ 
+ #include <polysolve/Utils.hpp>
++#include <polysolve/nonlinear/ClFact.hpp> // export build
++#include <polysolve/ClTime.hpp>
+ 
+ #if defined(SPDLOG_FMT_EXTERNAL)
+ #include <fmt/color.h>
+@@ -183,10 +185,12 @@
+                                               const TVector &grad,
+                                               TVector &direction)
+     {
++        cl::Scope cl_chain("H1.chain"); // export build
+         polysolve::StiffnessMatrix hessian;
+ 
+         {
+             POLYSOLVE_SCOPED_STOPWATCH("assembly time", this->assembly_time, m_logger);
++            cl::Scope cl_s("H1.assemble");
+             compute_hessian(objFunc, x, hessian);
+         }
+ 
+@@ -197,14 +201,24 @@
+             if (block_mapping.size() > 0)
+                 linear_solver->set_block_mapping(block_mapping);
+ 
++            cl::ctx().chain_analyzed = false; // export build
++            cl::ctx().chain_an_ns = 0;
+             analyze_pattern(hessian);
++            const long long cl_t0 = cl::any() ? cl::cpu_ns() : 0;
+ 
+             try
+             {
+-                linear_solver->factorize(hessian);
++                {
++                    cl::Scope cl_s("F1.chain");
++                    linear_solver->factorize(hessian);
++                }
++                if (cl::any())
++                    cl::fact_row(*linear_solver, hessian, cl::ctx().chain_analyzed, true, cl::ctx().chain_an_ns, cl::cpu_ns() - cl_t0, "chain");
+             }
+             catch (const std::runtime_error &err)
+             {
++                if (cl::any())
++                    cl::fact_row(*linear_solver, hessian, cl::ctx().chain_analyzed, false, cl::ctx().chain_an_ns, cl::cpu_ns() - cl_t0, "chain");
+                 // warn if using gradient descent
+                 m_logger.debug("Unable to factorize Hessian: \"{}\"", err.what());
+ 
+@@ -212,9 +226,13 @@
+                 return std::nan("");
+             }
+ 
+-            linear_solver->solve(-grad, direction); // H Δx = -g
++            {
++                cl::Scope cl_s("F3.chain");
++                linear_solver->solve(-grad, direction); // H Δx = -g
++            }
+         }
+ 
++        cl::Scope cl_r("H1.residual", double(hessian.nonZeros()));
+         const double residual = objFunc.grad_norm(hessian * direction + grad, norm_type); // H Δx + g = 0
+ 
+         json info;
+@@ -241,7 +259,16 @@
+ 
+         pattern_ok = false;
+         // TODO: get the correct size
+-        linear_solver->analyze_pattern(hessian, hessian.rows());
++        const long long cl_t0 = cl::any() ? cl::cpu_ns() : 0; // export build
++        {
++            cl::Scope cl_s("F2.chain");
++            linear_solver->analyze_pattern(hessian, hessian.rows());
++        }
++        if (cl::any())
++        {
++            cl::ctx().chain_analyzed = true;
++            cl::ctx().chain_an_ns = cl::cpu_ns() - cl_t0;
++        }
+         if (pattern_only && hessian.isCompressed())
+         {
+             pattern_outer.assign(hessian.outerIndexPtr(), hessian.outerIndexPtr() + hessian.outerSize() + 1);
+@@ -302,6 +329,7 @@
+ 
+     {
+         objFunc.set_project_to_psd(false);
++        cl::proj_flag() = false; // export build
+         objFunc.hessian(x, hessian);
+     }
+ 
+@@ -311,6 +339,7 @@
+ 
+     {
+         objFunc.set_project_to_psd(true);
++        cl::proj_flag() = true; // export build
+         objFunc.hessian(x, hessian);
+     }
+ 
+@@ -322,6 +351,7 @@
+         if (x.size() != x_cache.size() || x != x_cache)
+         {
+             objFunc.set_project_to_psd(project_to_psd);
++        cl::proj_flag() = project_to_psd; // export build
+             objFunc.hessian(x, hessian_cache);
+             x_cache = x;
+         }
+@@ -338,6 +368,7 @@
+ 
+     {
+         objFunc.set_project_to_psd(false);
++        cl::proj_flag() = false; // export build
+         objFunc.hessian(x, hessian);
+     }
+ 
+@@ -347,6 +378,7 @@
+ 
+     {
+         objFunc.set_project_to_psd(true);
++        cl::proj_flag() = true; // export build
+         objFunc.hessian(x, hessian);
+     }
+ 
+@@ -356,6 +388,7 @@
+ 
+     {
+         objFunc.set_project_to_psd(project_to_psd);
++        cl::proj_flag() = project_to_psd; // export build
+         objFunc.hessian(x, hessian);
+         if (reg_weight > 0)
+         {
+diff -ruN ps_orig/src/polysolve/nonlinear/descent_strategies/NonsmoothNewtonBase.cpp ps/src/polysolve/nonlinear/descent_strategies/NonsmoothNewtonBase.cpp
+--- ps_orig/src/polysolve/nonlinear/descent_strategies/NonsmoothNewtonBase.cpp	2026-11-23 12:21:05.199104113 -0500
++++ ps/src/polysolve/nonlinear/descent_strategies/NonsmoothNewtonBase.cpp	2026-11-23 15:35:08.942150984 -0500
+@@ -1,5 +1,7 @@
+ #include "NonsmoothNewtonBase.hpp"
+ #include "nonsmooth/PathRunner.hpp"
++#include <polysolve/ClExport.hpp> // export build
++#include <polysolve/ClTime.hpp>
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -223,6 +225,7 @@
+ 
+         // per direction
+         bool use_B = false;
++        Stats cl_s0; ///< export build: the counters at the start of the outer iteration
+ 
+         // handoff gate and Jg
+         int gate_refusals = 0;   ///< consecutive refusals of this solve without an accepted decrease larger than the energy resolution
+@@ -294,6 +297,17 @@
+     bool NonsmoothNewtonBase::compute_update_direction(Problem &objFunc, const TVector &x, const TVector &grad, TVector &direction)
+     {
+         Impl &m = *impl_;
++        cl::Scope cl_cd("N.compute");
++        if (cl::any())
++        {
++            cl::Scope cl_hook("X.hook");
++            // export build: the context of the rows of this outer iteration
++            cl::Ctx &cx = cl::ctx();
++            ++cx.outer;
++            cx.fact_in_outer = 0;
++            cx.fact_kind = "primary";
++            m.cl_s0 = m.st;
++        }
+         SelectionPort *const sel = selection_port(objFunc);
+         if (sel != nullptr && opts_.exact_gate_on())
+         {
+@@ -370,6 +384,7 @@
+         ctx.solve = [&](const TVector &rhs, TVector &out) { return m.basis.solve_plain(rhs, out); };
+         NonsmoothDelta delta;
+         int n = 0;
++        cl::Scope cl_sel("S1");
+         try
+         {
+             n = sel.select(ctx, delta);
+@@ -383,12 +398,35 @@
+         m.st.selected += n;
+         if (n > 0)
+             m.basis.apply_delta(delta);
++        if (cl::timers().on && std::getenv("POLYFEM_CL_BENCH") != nullptr)
++        {
++            // export build, bench run only: the selection again on the same data (the units it made exact stay exact), alone in its category, for its unit price
++            for (int r = 0; r < 3; ++r)
++            {
++                NonsmoothDelta d2;
++                int n2 = 0;
++                {
++                    cl::Scope cl_rep("S1.rep");
++                    try
++                    {
++                        n2 = sel.select(ctx, d2);
++                    }
++                    catch (const std::runtime_error &)
++                    {
++                        n2 = 0;
++                    }
++                }
++                if (n2 > 0)
++                    m.basis.apply_delta(d2);
++            }
++        }
+     }
+ 
+     bool NonsmoothNewtonBase::take_step(Problem &objFunc, const TVector &x, const double energy, const TVector &grad,
+                                         const TVector &direction, TVector &step)
+     {
+         Impl &m = *impl_;
++        cl::Scope cl_ts("N.take_step");
+         if (!m.use_B)
+         {
+             m.record(m.st.ls_iters, false, 0);
+@@ -447,6 +485,24 @@
+         }
+         if (sel != nullptr)
+             sel->outer_end(pi.trunc, n_inner);
++        if (cl::on())
++        {
++            cl::Scope cl_hook("X.hook");
++            // export build: the row of this outer iteration (the counters are the changes since the direction request)
++            const Stats &a = m.st, &b = m.cl_s0;
++            cl::Ctx &cx = cl::ctx();
++            long trunc_sum = 0;
++            for (const long t : pi.trunc)
++                trunc_sum += t;
++            cl::put({{"t", "outer"}, {"step", cx.step}, {"outer", cx.outer}, {"blind", opts_.selection == "blind"}, {"active", active}, {"path", took_path},
++                     {"inner_steps", n_inner}, {"inner_trunc", trunc_sum}, {"trunc", {pi.trunc[0], pi.trunc[1], pi.trunc[2], pi.trunc[3], pi.trunc[4], pi.trunc[5]}},
++                     {"projected", m.basis.projected}, {"handed_off", m.handed_off}, {"noise_stop", m.runner.noise_stop}, {"lnz", cx.last_lnz},
++                     {"d", {{"factorizations", a.factorizations - b.factorizations}, {"factorization_failures", a.factorization_failures - b.factorization_failures},
++                            {"back_substitutions", a.solves - b.solves}, {"true_energy", a.true_energy - b.true_energy}, {"nonsmooth_updates", a.rebuilds - b.rebuilds},
++                            {"retractions", a.retractions - b.retractions}, {"reread_calls", a.rr_calls - b.rr_calls}, {"reread_after_promotion", a.rr_after_promotion - b.rr_after_promotion},
++                            {"promotions", a.promotions - b.promotions}, {"selected", a.selected - b.selected}, {"select_calls", a.select_calls - b.select_calls},
++                            {"projected", a.projected - b.projected}, {"repair_rounds", a.repair_rounds - b.repair_rounds}}}});
++        }
+         if (took_path)
+         {
+             m.record(m.st.path_iters, active, n_inner);
+@@ -495,6 +551,15 @@
+ 
+     void NonsmoothNewtonBase::reset_times()
+     {
++        if (cl::any())
++        {
++            // export build: a minimize starts
++            cl::Ctx &cx = cl::ctx();
++            ++cx.step;
++            cx.outer = 0;
++            cx.blind = opts_.selection == "blind";
++            cl::put({{"t", "solve"}, {"step", cx.step}, {"blind", cx.blind}, {"selection", opts_.selection}});
++        }
+         impl_->st = Stats();
+         impl_->pending = Impl::Pending();
+         impl_->fresh = true;
+diff -ruN ps_orig/src/polysolve/nonlinear/descent_strategies/nonsmooth/BasisMatrix.cpp ps/src/polysolve/nonlinear/descent_strategies/nonsmooth/BasisMatrix.cpp
+--- ps_orig/src/polysolve/nonlinear/descent_strategies/nonsmooth/BasisMatrix.cpp	2026-11-23 11:51:34.432754307 -0500
++++ ps/src/polysolve/nonlinear/descent_strategies/nonsmooth/BasisMatrix.cpp	2026-11-23 15:46:48.706574566 -0500
+@@ -1,5 +1,7 @@
+ #include "BasisMatrix.hpp"
+ #include "../ParallelKernels.hpp"
++#include <polysolve/nonlinear/ClFact.hpp> // export build
++#include <polysolve/ClTime.hpp>
+ 
+ #include <algorithm>
+ 
+@@ -25,10 +27,18 @@
+     /// numeric factorization: the projected retry of an outer iteration usually has the same pattern.
+     void BasisMatrix::factorize(const SpMat &H)
+     {
++        const bool cl_on = cl::any(); // export build
++        long long cl_an = 0, cl_t0 = 0;
++        bool cl_analyzed = false;
+         if (!same_pattern(H))
+         {
++            if (cl_on)
++                cl_t0 = cl::cpu_ns();
+             pattern_ok_ = false;
+-            linear_->analyze_pattern(H, H.rows());
++            {
++                cl::Scope cl_s("F2");
++                linear_->analyze_pattern(H, H.rows());
++            }
+             if (H.isCompressed())
+             {
+                 pattern_outer_.assign(H.outerIndexPtr(), H.outerIndexPtr() + H.outerSize() + 1);
+@@ -36,17 +46,29 @@
+                 pattern_rows_ = H.rows();
+                 pattern_ok_ = true;
+             }
++            if (cl_on)
++            {
++                cl_analyzed = true;
++                cl_an = cl::cpu_ns() - cl_t0;
++            }
+         }
+         ++st_.factorizations;
++        if (cl_on)
++            cl_t0 = cl::cpu_ns();
+         try
+         {
++            cl::Scope cl_s("F1");
+             linear_->factorize(H);
+         }
+         catch (...)
+         {
+             ++st_.factorization_failures;
++            if (cl_on)
++                cl::fact_row(*linear_, H, cl_analyzed, false, cl_an, cl::cpu_ns() - cl_t0, cl::ctx().fact_kind);
+             throw;
+         }
++        if (cl_on)
++            cl::fact_row(*linear_, H, cl_analyzed, true, cl_an, cl::cpu_ns() - cl_t0, cl::ctx().fact_kind);
+     }
+ 
+     bool BasisMatrix::same_pattern(const SpMat &H) const
+@@ -61,6 +83,7 @@
+     {
+         ++st_.solves;
+         Vec out = Vec::Zero(rhs.size());
++        cl::Scope cl_s("F3");
+         linear_->solve(rhs, out);
+         return out;
+     }
+@@ -107,6 +130,7 @@
+     bool BasisMatrix::solve_plain(const Vec &rhs, Vec &out)
+     {
+         out = Vec::Zero(rhs.size());
++        cl::Scope cl_s("F3.select");
+         linear_->solve(rhs, out);
+         return true;
+     }
+@@ -115,6 +139,7 @@
+     {
+         if (delta.n == 0)
+             return false;
++        cl::Scope cl_s("N.apply_delta");
+         if (!subtract_in_place(Hnc, delta.dH))
+         {
+             SpMat t = Hnc - delta.dH;
+@@ -130,6 +155,7 @@
+ 
+     void BasisMatrix::assemble_parts(Problem &p, const Vec &x)
+     {
++        cl::Scope cl_s("N.assemble");
+         reanchored = false;
+         p.smooth_hessian(x, false, Hnc);
+         p.smooth_gradient(x, gnc);
+@@ -150,6 +176,7 @@
+         }
+         p.nonsmooth_gradient(x, gc0);
+         Ec0 = p.nonsmooth_value(x);
++        cl_s.add_units(double(B.nonZeros()));
+     }
+ 
+     bool BasisMatrix::try_solve(Problem &p, const SpMat &H, const Vec &g, Vec &d, const NormType nt)
+@@ -165,6 +192,7 @@
+             return false;
+         }
+         d = backsolve(-g);
++        cl::Scope cl_r("N.residual", double(H.nonZeros()));
+         Vec Hd(H.rows());
+         parallel::spmv(H, d, Hd);
+         const double res = p.grad_norm(Vec(Hd + g), nt);
+@@ -203,8 +231,11 @@
+ 
+     bool BasisMatrix::direction_projected_mode(Problem &p, const Vec &x, const Vec &g, Vec &d, const double h_edge)
+     {
++        cl::Scope cl_dir("N.direction");
+         projected = false;
++        cl::ctx().fact_kind = "primary"; // export build
+         bool ok = try_solve(p, B, g, d, NormType::EUCLIDEAN);
++        cl::ctx().fact_kind = "repair";
+         if (!ok && factor_failed_ && opts_.basis_repair == "r_ad")
+             ok = repair(p, x, g, d);
+         if (ok && opts_.guard)
+@@ -223,6 +254,7 @@
+         }
+         projected = true;
+         ++st_.projected;
++        cl::ctx().fact_kind = "retry_proj"; // export build
+         return try_solve(p, B, g, d, NormType::EUCLIDEAN);
+     }
+ } // namespace polysolve::nonlinear
+diff -ruN ps_orig/src/polysolve/nonlinear/descent_strategies/nonsmooth/ClPath.hpp ps/src/polysolve/nonlinear/descent_strategies/nonsmooth/ClPath.hpp
+--- ps_orig/src/polysolve/nonlinear/descent_strategies/nonsmooth/ClPath.hpp	1969-12-31 19:00:00.000000000 -0500
++++ ps/src/polysolve/nonlinear/descent_strategies/nonsmooth/ClPath.hpp	2026-11-23 12:58:13.420918872 -0500
+@@ -0,0 +1,29 @@
++#pragma once
++
++// EXPORT BUILD ONLY: the problem and the inner counter of the running path, for the hooks of ReducedMatrix (see polysolve/ClExport.hpp).
++
++#include <polysolve/ClExport.hpp>
++#include <polysolve/nonlinear/Problem.hpp>
++
++namespace polysolve::nonlinear::clh
++{
++    inline Problem *&problem()
++    {
++        static Problem *p = nullptr;
++        return p;
++    }
++    /// set while PathRunner::run is running: the problem and the number of accepted inner steps
++    struct PathScope
++    {
++        PathScope(Problem &p, const int &inner)
++        {
++            problem() = &p;
++            cl::ctx().inner_ptr = &inner;
++        }
++        ~PathScope()
++        {
++            problem() = nullptr;
++            cl::ctx().inner_ptr = nullptr;
++        }
++    };
++} // namespace polysolve::nonlinear::clh
+diff -ruN ps_orig/src/polysolve/nonlinear/descent_strategies/nonsmooth/PathRunner.cpp ps/src/polysolve/nonlinear/descent_strategies/nonsmooth/PathRunner.cpp
+--- ps_orig/src/polysolve/nonlinear/descent_strategies/nonsmooth/PathRunner.cpp	2026-11-23 12:21:05.198597913 -0500
++++ ps/src/polysolve/nonlinear/descent_strategies/nonsmooth/PathRunner.cpp	2026-11-23 15:46:48.706430323 -0500
+@@ -1,5 +1,7 @@
+ #include "PathRunner.hpp"
+ #include "../ParallelKernels.hpp"
++#include "ClPath.hpp" // export build
++#include <polysolve/ClTime.hpp>
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -59,6 +61,7 @@
+     /// below the floor jfloor (-inf: off), 2 if an element's volume ratio to x is below the bound.
+     int PathRunner::jacobian_violation(Problem &p, const Vec &x, const Vec &y, const double jfloor)
+     {
++        cl::Scope cl_s("V1.jacobian_limit");
+         double min_j = NaN, min_ratio = NaN; // both from one sweep over the elements
+         p.smooth_min_jacobians(x, y, jfloor > -INFINITY, opts_.jacobian_bound > 0, min_j, min_ratio);
+         if (jfloor > -INFINITY && !(min_j >= jfloor))
+@@ -76,6 +79,7 @@
+     /// Nonsmooth term at reduced y; rebuilds its state unless reuse matches y.
+     NonsmoothEval PathRunner::eval(Problem &p, const Vec &y, bool deriv, NonsmoothEval *reuse)
+     {
++        cl::Scope cl_s("P.eval");
+         NonsmoothEval c;
+         c.y = y;
+         if (reuse && reuse->y.size() == c.y.size() && reuse->y == c.y)
+@@ -115,6 +119,7 @@
+ 
+     double PathRunner::true_energy(Problem &p, const Vec &y)
+     {
++        cl::Scope cl_s("V1.true_energy");
+         ++st_.true_energy;
+         if (opts_.dedupe)
+         {
+@@ -130,6 +135,8 @@
+     // ------------------------------------------------------------------------------------------------ protected path
+     bool PathRunner::run(Problem &p, const Vec &x, const Vec &g, double E0, const Vec &pN, Vec &step, int &n_inner, const PathContext &ctx)
+     {
++        cl::Scope cl_run("P.run");
++        clh::PathScope cl_scope(p, n_inner); // export build: the problem and the inner counter for the hooks of ReducedMatrix
+         last_built_.resize(0); // the nonsmooth state is only tracked inside this function
+         noise_stop = false;
+         info = PathInfo();
+@@ -211,12 +218,14 @@
+                 p.solution_changed(y); // the full state, as the true energy at y would build it
+                 last_built_ = y;
+             }
++            cl::Scope cl_g("G2.gradient");
+             p.gradient(y, rr_gcur);
+             return rr_gcur.size() == y.size() && rr_gcur.allFinite();
+         };
+         // cR, cq and m_off at the current point pk (state cstate, true gradient rr_gcur, model value m_cur): the model gradient there
+         // becomes the true one, the value stays
+         const auto rr_set = [&](const Vec &pk, const bool after_promotion) {
++            cl::Scope cl_s("G2.set", double(n) * double(M.k));
+             const int k = M.k;
+             Vec hp(n);
+             parallel::spmv(basis_.Hnc, pk, hp);
+@@ -544,6 +553,7 @@
+                 seg_off.push_back(M.m_off);
+             }
+             ++n_inner;
++            cl_run.add_units(double(n) * double(k)); // export build
+             const double prev_total = pred_total;
+             pred_total = -m_cur;
+             const bool relative = opts_.relative_stop > 0 && prev_total > 0 && (pred_total - prev_total) < opts_.relative_stop * pred_total;
+diff -ruN ps_orig/src/polysolve/nonlinear/descent_strategies/nonsmooth/ReducedMatrix.cpp ps/src/polysolve/nonlinear/descent_strategies/nonsmooth/ReducedMatrix.cpp
+--- ps_orig/src/polysolve/nonlinear/descent_strategies/nonsmooth/ReducedMatrix.cpp	2026-11-23 12:21:05.197821034 -0500
++++ ps/src/polysolve/nonlinear/descent_strategies/nonsmooth/ReducedMatrix.cpp	2026-11-23 15:26:41.728185196 -0500
+@@ -1,5 +1,7 @@
+ #include "ReducedMatrix.hpp"
+ #include "../ParallelKernels.hpp"
++#include "ClPath.hpp" // export build
++#include <polysolve/ClTime.hpp>
+ 
+ #include <Eigen/Dense>
+ 
+@@ -44,6 +46,7 @@
+         first_ = true;
+         merged_ = false;
+         t_.reset();
++        cl_t_.reset();
+     }
+ 
+     long ReducedMatrix::structure_nnz() const { return t_ ? long(t_->inner.size()) : 0; }
+@@ -205,6 +208,174 @@
+ 
+     void ReducedMatrix::build(const Mat &Q, const Mat &G, const NonsmoothEval &c, const int k, Mat &A)
+     {
++        // export build: the counting and export hook after the original build (it does not change a number)
++        if (!cl::any())
++        {
++            build_impl(Q, G, c, k, A);
++            return;
++        }
++        const bool first = first_;
++        {
++            cl::Scope cl_s("A1", double(c.blocks.size()));
++            build_impl(Q, G, c, k, A);
++        }
++        cl::Scope cl_hook("X.hook");
++        cl_point(Q, c, k, first);
++    }
++
++    void ReducedMatrix::cl_point(const Mat &Q, const NonsmoothEval &c, const int k, const bool first)
++    {
++        cl::Ctx &cx = cl::ctx();
++        Problem *const p = clh::problem();
++        const long point = cx.point++;
++        json row = {{"t", "point"}, {"step", cx.step}, {"outer", cx.outer}, {"inner", cx.inner_ptr != nullptr ? long(*cx.inner_ptr) : 0L}, {"point", point}, {"blind", cx.blind}, {"n", long(Q.rows())}, {"k", k}};
++        if (!c.local)
++        {
++            row.update({{"local", false}, {"nb", 0}, {"a1_form", "global"}, {"a1_nnzK", long(c.K.nonZeros())}});
++            cl::put(row);
++            return;
++        }
++        if (first)
++        {
++            if (merged_)
++                cl_t_ = t_;
++            else
++            {
++                const std::shared_ptr<Structure> saved = t_;
++                make_structure(c, Q.rows());
++                cl_t_ = t_;
++                t_ = saved;
++            }
++        }
++        const Structure *T = cl_t_.get();
++        std::vector<int> kinds;
++        const bool have_kinds = p != nullptr && p->nonsmooth_cl_block_kinds(kinds) && kinds.size() == c.blocks.size();
++        long hist[13];
++        for (long &h : hist)
++            h = 0;
++        long written_all = 0, written_in = 0, n_new = 0;
++        long kind_count[6] = {0, 0, 0, 0, 0, 0};
++        std::vector<char> is_new(c.blocks.size(), 0);
++        for (size_t b = 0; b < c.blocks.size(); ++b)
++        {
++            const HessianBlock &hb = c.blocks[b];
++            ++hist[std::min(hb.size, 12)];
++            long valid = 0;
++            for (int i = 0; i < hb.size; ++i)
++                valid += hb.indices[i] >= 0 ? 1 : 0;
++            written_all += valid * valid;
++            bool found = false;
++            if (T != nullptr)
++            {
++                const uint64_t h = hash_order(hb.indices.data(), hb.size);
++                const auto rg = T->by_hash.equal_range(h);
++                for (auto it = rg.first; it != rg.second && !found; ++it)
++                {
++                    const Structure::Blk &B = T->blk[size_t(it->second)];
++                    if (B.m != hb.size)
++                        continue;
++                    bool same = true;
++                    for (int i = 0; i < hb.size && same; ++i)
++                        same = B.ord[size_t(i)] == hb.indices[i];
++                    found = same;
++                }
++            }
++            if (found)
++                written_in += valid * valid;
++            else
++            {
++                ++n_new;
++                is_new[b] = 1;
++            }
++            ++kind_count[have_kinds ? std::clamp(kinds[b], 0, 5) : 5];
++        }
++        row.update({{"nb", long(c.blocks.size())},
++                    {"nb_by_size", {{"6", hist[6]}, {"9", hist[9]}, {"12", hist[12]}}},
++                    {"exact_el", kind_count[0]},
++                    {"exact_pairs", {{"ee", kind_count[1]}, {"fv", kind_count[2]}, {"ev", kind_count[3]}, {"vv", kind_count[4]}, {"other", kind_count[5]}}},
++                    {"a1_form", merged_ ? "merged_tau0" : "current"},
++                    {"a1_nR", T != nullptr ? long(T->R.size()) : 0L},
++                    {"a1_nnzK", T != nullptr ? long(T->inner.size()) : 0L},
++                    {"a1_written", written_all},
++                    {"a1_written_in", written_in},
++                    {"a1_new_blocks", n_new},
++                    {"a1_struct_built", first}});
++        cl::put(row);
++        if (!cl::xon() || p == nullptr)
++            return;
++        cl::Export &ex = cl::exporter();
++        if (!ex.mesh_done)
++            ex.mesh_done = p->nonsmooth_cl_export_mesh(ex.dir + "/ccdmesh.bin");
++        cl::ExportItem *it = ex.offer("blocks", n_new);
++        if (it == nullptr)
++            return;
++        std::string path;
++        cl::ExportSub &s = ex.sub(*it, "blocks", path);
++        s.step = cx.step;
++        s.outer = cx.outer;
++        s.point = point;
++        s.n = long(Q.rows());
++        s.nnz = long(c.blocks.size());
++        s.extra = "new_blocks=" + std::to_string(n_new) + ";k=" + std::to_string(k);
++        {
++            cl::BinOut o(path);
++            if (o.ok())
++            {
++                const int n = int(Q.rows()), cap = int(Q.cols());
++                o.magic("CLBLK001");
++                o.i64(n);
++                o.i64(k);
++                o.i64(cap);
++                o.i64((long long)c.blocks.size());
++                o.i64(n_new);
++                o.i64(cx.step);
++                o.i64(cx.outer);
++                o.i64(point);
++                std::vector<double> rowq(size_t(cap), 0.0);
++                for (int i = 0; i < n; ++i)
++                {
++                    for (int j = 0; j < cap; ++j)
++                        rowq[size_t(j)] = j < k ? Q(i, j) : 0.0;
++                    o.f64v(rowq.data(), size_t(cap));
++                }
++                for (size_t b = 0; b < c.blocks.size(); ++b)
++                {
++                    const HessianBlock &hb = c.blocks[b];
++                    int idx[12];
++                    for (int i = 0; i < 12; ++i)
++                        idx[i] = i < hb.size ? hb.indices[size_t(i)] : -1;
++                    o.i32(hb.size);
++                    o.i32v(idx, 12);
++                    o.i32(have_kinds ? kinds[b] : 5);
++                    o.i32(is_new[b] ? 1 : 0);
++                    double Hc[144];
++                    for (int a = 0; a < 144; ++a)
++                        Hc[a] = 0.0;
++                    for (int j = 0; j < hb.size; ++j)
++                        for (int i = 0; i < hb.size; ++i)
++                            Hc[i + 12 * j] = hb.H(i, j);
++                    o.f64v(Hc, 144);
++                }
++            }
++        }
++        std::string epath;
++        cl::ExportSub &e = ex.sub(*it, "elem", epath);
++        e.step = cx.step;
++        e.outer = cx.outer;
++        e.point = point;
++        e.solver_ns = 0;
++        const long ne = p->nonsmooth_cl_export_elem(c.y, epath, cx.step, cx.outer, point);
++        e.n = ne;
++        if (ne < 0)
++        {
++            std::error_code ec;
++            std::filesystem::remove(epath, ec);
++            it->subs.pop_back(); // no closed-form kernel / no exact elements: no elem file
++        }
++    }
++
++    void ReducedMatrix::build_impl(const Mat &Q, const Mat &G, const NonsmoothEval &c, const int k, Mat &A)
++    {
+         if (!c.local)
+         {
+             const Mat KQ = c.K * Q.leftCols(k);
+diff -ruN ps_orig/src/polysolve/nonlinear/descent_strategies/nonsmooth/ReducedMatrix.hpp ps/src/polysolve/nonlinear/descent_strategies/nonsmooth/ReducedMatrix.hpp
+--- ps_orig/src/polysolve/nonlinear/descent_strategies/nonsmooth/ReducedMatrix.hpp	2026-11-23 12:21:05.197360644 -0500
++++ ps/src/polysolve/nonlinear/descent_strategies/nonsmooth/ReducedMatrix.hpp	2026-11-23 12:58:13.432478965 -0500
+@@ -63,6 +63,10 @@
+         void add_blocks(const Mat &Q, const NonsmoothEval &c, const int k, Mat &S, const Eigen::Index b0, const Eigen::Index b1) const;
+         void make_structure(const NonsmoothEval &c, const Eigen::Index n);
+         void build_merged(const Mat &Q, const Mat &G, const NonsmoothEval &c, const int k, Mat &A);
++        // export build: the original build, and the counting / export hook that follows it
++        void build_impl(const Mat &Q, const Mat &G, const NonsmoothEval &c, const int k, Mat &A);
++        void cl_point(const Mat &Q, const NonsmoothEval &c, const int k, const bool first);
++        std::shared_ptr<Structure> cl_t_; ///< the structure of the first point of the outer iteration (also without the merged form)
+ 
+         /// row r of the first k columns of Q into dst
+         template <typename Dst>
+diff -ruN ps_orig/src/polysolve/nonlinear/descent_strategies/nonsmooth/SubspaceModel.cpp ps/src/polysolve/nonlinear/descent_strategies/nonsmooth/SubspaceModel.cpp
+--- ps_orig/src/polysolve/nonlinear/descent_strategies/nonsmooth/SubspaceModel.cpp	2026-11-23 12:21:05.198364647 -0500
++++ ps/src/polysolve/nonlinear/descent_strategies/nonsmooth/SubspaceModel.cpp	2026-11-23 15:46:48.706526034 -0500
+@@ -1,4 +1,5 @@
+ #include "SubspaceModel.hpp"
++#include <polysolve/ClTime.hpp> // export build
+ #include "../ParallelKernels.hpp"
+ 
+ #include <Eigen/Cholesky>
+@@ -10,6 +11,7 @@
+     SubspaceModel::SubspaceModel(const BasisMatrix &basis, ReducedMatrix &reduced, const int n_, const int cap_, const bool reduced_algebra, const bool row_major_q)
+         : n(n_), cap(cap_), reduced_algebra_(reduced_algebra), row_major_(row_major_q), basis_(basis), reduced_(reduced)
+     {
++        cl::Scope cl_s("A2.alloc", double(n_) * double(cap_));
+         if (row_major_)
+             Qr.resize(n, cap);
+         Q.resize(n, cap);
+@@ -21,6 +23,7 @@
+ 
+     void SubspaceModel::add_column(const Vec &q)
+     {
++        cl::Scope cl_s("A2.col", double(n)*double(k));
+         const int j = k;
+         Q.col(j) = q;
+         parallel::spmv(basis_.Hnc, q, HQ.col(j));
+@@ -42,6 +45,7 @@
+ 
+     void SubspaceModel::apply_delta(const NonsmoothDelta &delta)
+     {
++        cl::Scope cl_s("A2.delta", double(n)*double(k));
+         if (k == 0)
+             return;
+         const Mat dHQ = Mat(delta.dH * Q.leftCols(k));
+@@ -65,6 +69,7 @@
+ 
+     SubspaceModel::Eval SubspaceModel::eval(const Vec &z, const NonsmoothEval &c, bool deriv) const
+     {
++        cl::Scope cl_s(deriv ? "A2.eval" : "A2.eval0", double(n)*double(k));
+         Eval e;
+         const Vec zk = z.head(k);
+         const Mat Gk = Mat(G.topLeftCorner(k, k));
+@@ -138,6 +143,7 @@
+ 
+     bool SubspaceModel::lm_step(const Mat &A, const Vec &grad, Vec &dz)
+     {
++        cl::Scope cl_s("A2.lm", double(A.rows()));
+         const double anorm = A.cwiseAbs().rowwise().sum().maxCoeff();
+         const double sigma0 = 1e-5 * std::max(1.0, anorm);
+         Mat As = A;

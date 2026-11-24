@@ -1,0 +1,1159 @@
+diff -ruN pf_orig/src/polyfem/solver/BarrierContactNonsmoothTerm.cpp pf/src/polyfem/solver/BarrierContactNonsmoothTerm.cpp
+--- pf_orig/src/polyfem/solver/BarrierContactNonsmoothTerm.cpp	2026-11-23 11:52:17.880061380 -0500
++++ pf/src/polyfem/solver/BarrierContactNonsmoothTerm.cpp	2026-11-23 16:26:46.607822558 -0500
+@@ -12,6 +12,9 @@
+ #include <polyfem/utils/Logger.hpp>
+ #include <polyfem/utils/MaybeParallelFor.hpp>
+ 
++#include <polysolve/ClExport.hpp> // export build
++#include <polysolve/ClTime.hpp>
++#include <polysolve/ClTime.hpp> // export build
+ #include <ipc/candidates/candidates.hpp>
+ #include <ipc/utils/eigen_ext.hpp>
+ #include <ipc/collision_mesh.hpp>
+@@ -509,6 +512,7 @@
+ 		auto &a = anchor_->anchor;
+ 		if (a.x.size() == x.size() && a.x == x)
+ 			return;
++		polysolve::cl::Scope cl_s("NT.anchor"); // export build
+ 		fast_validity_->anchor(x, problem_.reduced_to_full(x), a);
+ 	}
+ 
+@@ -538,6 +542,7 @@
+ 			const Vec xf = problem_.reduced_to_full(x);
+ 			if (!(jdet_key_.size() == xf.size() && jdet_key_ == xf))
+ 			{
++				polysolve::cl::Scope cl_s("NT.jdets"); // export build
+ 				jdet_ = fast_validity_->dets(xf);
+ 				jdet_key_ = xf;
+ 			}
+@@ -720,6 +725,82 @@
+ 		}
+ 		if (lift_exact())
+ 			lift_blocks(yf, blocks, grad);
++		if (polysolve::cl::any())
++		{
++			polysolve::cl::Scope cl_hook("X.hook");
++			// export build: the kind of each block (contact pairs by type, friction, then the lifted elements)
++			cl_kinds_.assign(blocks.size(), 0);
++			for (size_t i = 0; i < nb; ++i)
++				cl_kinds_[i] = cs.is_edge_edge(i) ? 1 : cs.is_face_vertex(i) ? 2 : cs.is_edge_vertex(i) ? 3 : cs.is_vertex_vertex(i) ? 4 : 5;
++			for (size_t i = 0; i < nf; ++i)
++				cl_kinds_[nb + i] = 5;
++		}
++		return true;
++	}
++
++	// ------------------------------------------------------------------------------------------------ export build
++	bool BarrierContactNonsmoothTerm::cl_block_kinds(std::vector<int> &kinds) const
++	{
++		if (cl_kinds_.empty())
++			return false;
++		kinds = cl_kinds_;
++		return true;
++	}
++
++	long BarrierContactNonsmoothTerm::cl_write_elem(const std::vector<int> &ids, const Eigen::VectorXd &xfull, const std::string &file, const long step, const long outer, const long point) const
++	{
++		if (!elastic_ || ids.empty())
++			return -1;
++		std::vector<double> B, lam, mu, da, u;
++		if (!elastic_->cl_elements(ids, xfull, B, lam, mu, da, u))
++			return -1;
++		polysolve::cl::BinOut o(file);
++		if (!o.ok())
++			return -1;
++		o.magic("CLELM001");
++		o.i64((long long)ids.size());
++		o.i64(step);
++		o.i64(outer);
++		o.i64(point);
++		o.i32v(ids.data(), ids.size());
++		o.f64v(B.data(), B.size());
++		o.f64v(lam.data(), lam.size());
++		o.f64v(mu.data(), mu.size());
++		o.f64v(da.data(), da.size());
++		o.f64v(u.data(), u.size());
++		return long(ids.size());
++	}
++
++	long BarrierContactNonsmoothTerm::cl_export_elem(const Eigen::VectorXd &xfull, const std::string &file, const long step, const long outer, const long point)
++	{
++		if (!lift_exact())
++			return -1;
++		return cl_write_elem(lift_->ids, xfull, file, step, outer, point);
++	}
++
++	bool BarrierContactNonsmoothTerm::cl_export_mesh(const std::string &file) const
++	{
++		const ipc::CollisionMesh &m = mesh_;
++		polysolve::cl::BinOut o(file);
++		if (!o.ok())
++			return false;
++		const Eigen::MatrixXd &rest = m.rest_positions();
++		const auto &Ed = m.edges();
++		const auto &Fd = m.faces();
++		o.magic("CLCMSH01");
++		o.i64(rest.rows());
++		o.i64(Ed.rows());
++		o.i64(Fd.rows());
++		o.i64(3);
++		for (Eigen::Index i = 0; i < rest.rows(); ++i)
++			for (int d = 0; d < 3; ++d)
++				o.f64(d < rest.cols() ? rest(i, d) : 0.0);
++		for (Eigen::Index i = 0; i < Ed.rows(); ++i)
++			for (int d = 0; d < 2; ++d)
++				o.i32(int(Ed(i, d)));
++		for (Eigen::Index i = 0; i < Fd.rows(); ++i)
++			for (int d = 0; d < 3; ++d)
++				o.i32(int(Fd(i, d)));
+ 		return true;
+ 	}
+ 
+diff -ruN pf_orig/src/polyfem/solver/BarrierContactNonsmoothTerm.hpp pf/src/polyfem/solver/BarrierContactNonsmoothTerm.hpp
+--- pf_orig/src/polyfem/solver/BarrierContactNonsmoothTerm.hpp	2026-11-23 11:52:17.880233213 -0500
++++ pf/src/polyfem/solver/BarrierContactNonsmoothTerm.hpp	2026-11-23 12:59:55.759467410 -0500
+@@ -121,7 +121,16 @@
+ 		/// @brief The friction form of the term (null: the problem has no friction)
+ 		const std::shared_ptr<FrictionForm> &friction() const { return friction_; }
+ 
++		// export build (tools/nonsmooth_counting/export)
++		bool cl_block_kinds(std::vector<int> &kinds) const override;
++		long cl_export_elem(const Eigen::VectorXd &xfull, const std::string &file, const long step, const long outer, const long point) override;
++		bool cl_export_mesh(const std::string &file) const override;
++
+ 	protected:
++		// export build
++		long cl_write_elem(const std::vector<int> &ids, const Eigen::VectorXd &xfull, const std::string &file, const long step, const long outer, const long point) const;
++		std::vector<int> cl_kinds_; ///< kind of each block of the last hessian_blocks (NonsmoothTerm::cl_block_kinds)
++
+ 		// --- first layer in the energy split: the lifted elastic elements (the lift set of the time step) ---
+ 		bool lift_exact() const;
+ 		void init_lift();
+diff -ruN pf_orig/src/polyfem/solver/BilateralSegmentCertifier.cpp pf/src/polyfem/solver/BilateralSegmentCertifier.cpp
+--- pf_orig/src/polyfem/solver/BilateralSegmentCertifier.cpp	2026-11-23 00:02:36.356297248 -0500
++++ pf/src/polyfem/solver/BilateralSegmentCertifier.cpp	2026-11-23 17:09:58.153805482 -0500
+@@ -4,6 +4,10 @@
+ #include <polyfem/solver/forms/BarrierContactForm.hpp>
+ #include <polyfem/utils/MaybeParallelFor.hpp>
+ 
++#include <polysolve/ClExport.hpp> // export build
++#include <cstdio>
++#include <cstdlib>
++#include <polysolve/ClTime.hpp> // export build
+ #include <ipc/candidates/candidates.hpp>
+ #include <ipc/candidates/edge_edge.hpp>
+ #include <ipc/candidates/face_vertex.hpp>
+@@ -69,6 +73,40 @@
+ 
+ 	double BilateralSegmentCertifier::max_step_size(const Eigen::VectorXd &x0, const Eigen::VectorXd &x1)
+ 	{
++		// export build: the cpu time, the candidates at the start, and the export item (offered before the call so that the TI queries can be recorded)
++		const long long cl_t0 = polysolve::cl::any() ? polysolve::cl::cpu_ns() : 0;
++		polysolve::cl::ExportItem *const cl_item = polysolve::cl::xon() ? polysolve::cl::exporter().offer("surf_ccd") : nullptr;
++		std::vector<polysolve::cl::TiQuery> cl_q;
++		long cl_ti_fam[5] = {0, 0, 0, 0, 0};
++		// the Tight Inclusion queries of the calls of the run (tiq_all.bin of the export directory): every call while the budget lasts, then every 2nd, 4th, ... (the weight is in the record)
++		struct TiAll
++		{
++			std::FILE *f = nullptr;
++			long calls = 0, written = 0, stride = 1;
++			long budget = 1000000;
++			bool open = false;
++			~TiAll()
++			{
++				if (f != nullptr)
++					std::fclose(f);
++			}
++		};
++		static TiAll cl_all;
++		bool cl_rec_all = false;
++		if (polysolve::cl::xon())
++		{
++			if (!cl_all.open)
++			{
++				cl_all.open = true;
++				if (const char *b = std::getenv("POLYFEM_CL_TIQ_BUDGET"))
++					cl_all.budget = std::atol(b);
++				cl_all.f = std::fopen((polysolve::cl::exporter().dir + "/tiq_all.bin").c_str(), "wb");
++				if (cl_all.f != nullptr)
++					std::fwrite("CLTIQA01", 1, 8, cl_all.f);
++			}
++			cl_rec_all = cl_all.f != nullptr && (cl_all.calls++ % cl_all.stride == 0);
++		}
++		const long cl_cert0 = n_certified, cl_ti0 = n_ti, cl_drop0 = n_dropped;
+ 		// certificate factor for the stock separation rule (TI stops at 0.2 D(a), i.e. conservative rescaling 0.8)
+ 		constexpr double cert_c = 0.8;
+ 		const Eigen::VectorXd f0 = problem_.reduced_to_full(x0), f1 = problem_.reduced_to_full(x1);
+@@ -83,6 +121,7 @@
+ 		const double far_thr = 1.001 * contact_->dhat();
+ 		const auto V0 = contact_->compute_displaced_surface(f0);
+ 		const auto V1 = contact_->compute_displaced_surface(f1);
++		polysolve::cl::Scope cl_narrow("C2.narrow"); // export build: the narrow phase itself (certificate and Tight Inclusion)
+ 		const auto &E = mesh_.edges();
+ 		const auto &Fc = mesh_.faces();
+ 		const double margin = 1e-3 * contact_->dhat();
+@@ -94,6 +133,7 @@
+ 		// the certificate and the dedupe test of a candidate do not depend on the other candidates or on the earliest time
+ 		// of impact: in parallel, flagging the candidates left for Tight Inclusion
+ 		const size_t nC = C.size();
++		const size_t cl_nvv = C.vv_candidates.size(), cl_nev = C.ev_candidates.size(), cl_nee = C.ee_candidates.size(), cl_nfv = C.fv_candidates.size(); // export build
+ 		std::vector<char> to_ti(nC, 0);
+ 		utils::maybe_parallel_for(int(nC), [&](int start, int end, int /*thread_id*/) {
+ 			for (size_t i = start; i < size_t(end); ++i)
+@@ -132,6 +172,28 @@
+ 			const ipc::VectorMax12d xa = s.dof(V0, E, Fc), xb = s.dof(V1, E, Fc);
+ 			double toi = 1;
+ 			++n_ti;
++			if (polysolve::cl::any())
++			{
++				polysolve::cl::Scope cl_hook("X.hook");
++				// export build: the query as handed to Tight Inclusion
++				const int fam = i < cl_nvv ? 0 : i < begin_ee ? 1 : i < begin_fv ? 2 : i < end_fv ? 3 : 4;
++				++cl_ti_fam[fam];
++				if ((cl_item != nullptr || cl_rec_all) && fam < 4)
++				{
++					polysolve::cl::TiQuery q;
++					q.family = fam;
++					q.nv = int(xa.size() / 3);
++					q.tmax = earliest;
++					for (int a = 0; a < 12; ++a)
++						q.xa[a] = q.xb[a] = 0.0;
++					for (int a = 0; a < xa.size() && a < 12; ++a)
++					{
++						q.xa[a] = xa[a];
++						q.xb[a] = xb[a];
++					}
++					cl_q.push_back(q);
++				}
++			}
+ 			if (s.ccd(xa, xb, toi, 0.0, earliest, ti))
+ 			{
+ 				if (toi < earliest)
+@@ -165,6 +227,40 @@
+ 			filt(C.ee_candidates, off_ee);
+ 			filt(C.fv_candidates, off_fv);
+ 		}
++		if (polysolve::cl::any())
++		{
++			polysolve::cl::Scope cl_hook("X.hook");
++			// export build: the narrow phase of the certified path (the certificate on every edge-edge and face-vertex candidate, Tight Inclusion on the others)
++			const long long ns = polysolve::cl::cpu_ns() - cl_t0;
++			auto &cx = polysolve::cl::ctx();
++			polysolve::cl::put({{"t", "ccd"}, {"kind", "narrow"}, {"path", "cert"}, {"step", cx.step}, {"outer", cx.outer}, {"seq", cx.ccd_seq++}, {"nv", long(mesh_.num_vertices())}, {"calls", 1},
++								{"cand", {{"vv", long(cl_nvv)}, {"ev", long(cl_nev)}, {"ee", long(cl_nee)}, {"fv", long(cl_nfv)}}},
++								{"ti", {{"vv", cl_ti_fam[0]}, {"ev", cl_ti_fam[1]}, {"ee", cl_ti_fam[2]}, {"fv", cl_ti_fam[3]}, {"other", cl_ti_fam[4]}}},
++								{"ti_pairs", n_ti - cl_ti0}, {"certified", n_certified - cl_cert0}, {"dropped", n_dropped - cl_drop0}, {"cpu_ns", ns}});
++			if (cl_rec_all && !cl_q.empty())
++			{
++				// the record of the call: seq, step, outer, number of queries, weight; then the queries
++				auto &ca = cl_all;
++				const long long hdr[5] = {cx.ccd_seq - 1, cx.step, cx.outer, (long long)cl_q.size(), ca.stride};
++				std::fwrite(hdr, sizeof(long long), 5, ca.f);
++				for (const polysolve::cl::TiQuery &q : cl_q)
++				{
++					std::fwrite(&q.family, sizeof(int), 1, ca.f);
++					std::fwrite(&q.nv, sizeof(int), 1, ca.f);
++					std::fwrite(&q.tmax, sizeof(double), 1, ca.f);
++					std::fwrite(q.xa, sizeof(double), 12, ca.f);
++					std::fwrite(q.xb, sizeof(double), 12, ca.f);
++				}
++				ca.written += long(cl_q.size());
++				long lg = 0;
++				for (long t = ca.stride; t > 1; t >>= 1)
++					++lg;
++				if (ca.written > ca.budget * (1 + lg)) // the stored queries use up the budget of this stride: later calls are stored every 2nd, 4th, ... time
++					ca.stride *= 2;
++			}
++			if (cl_item != nullptr)
++				contact_->cl_export_surf(0, V0, &V1, std::min(step, earliest), long(nC), ns, cl_item, "cert", &cl_q);
++		}
+ 		return std::min(step, earliest);
+ 	}
+ } // namespace polyfem::solver
+diff -ruN pf_orig/src/polyfem/solver/FullNLProblem.cpp pf/src/polyfem/solver/FullNLProblem.cpp
+--- pf_orig/src/polyfem/solver/FullNLProblem.cpp	2026-10-25 14:21:02.780853813 -0400
++++ pf/src/polyfem/solver/FullNLProblem.cpp	2026-11-23 16:37:43.434145109 -0500
+@@ -1,5 +1,24 @@
+ #include "FullNLProblem.hpp"
+ #include <polyfem/utils/Logger.hpp>
++#include <polysolve/ClTime.hpp> // export build
++#include <polyfem/solver/forms/BarrierContactForm.hpp>
++#include <polyfem/solver/forms/FrictionForm.hpp>
++
++namespace polyfem::solver
++{
++	namespace
++	{
++		/// export build: the work units of a form's operation: the collision pairs of the contact and friction forms, else 1
++		double cl_form_units(const std::shared_ptr<Form> &f)
++		{
++			if (const auto *c = dynamic_cast<const BarrierContactForm *>(f.get()))
++				return double(c->collision_set().size());
++			if (const auto *fr = dynamic_cast<const FrictionForm *>(f.get()))
++				return double(fr->friction_collision_set().size());
++			return 1.0;
++		}
++	} // namespace
++} // namespace polyfem::solver
+ 
+ namespace polyfem::solver
+ {
+@@ -66,13 +85,13 @@
+ 	void FullNLProblem::line_search_begin(const TVector &x0, const TVector &x1)
+ 	{
+ 		for (auto &f : forms_)
+-			f->line_search_begin(x0, x1);
++			{ polysolve::cl::Scope cl_s(std::string("form.") + f->name() + ".ls_begin", 1); f->line_search_begin(x0, x1); }
+ 	}
+ 
+ 	void FullNLProblem::line_search_end()
+ 	{
+ 		for (auto &f : forms_)
+-			f->line_search_end();
++			{ polysolve::cl::Scope cl_s(std::string("form.") + f->name() + ".ls_end", 1); f->line_search_end(); }
+ 	}
+ 
+ 	double FullNLProblem::max_step_size(const TVector &x0, const TVector &x1)
+@@ -80,23 +99,33 @@
+ 		double step = 1;
+ 		for (auto &f : forms_)
+ 			if (f->enabled())
+-				step = std::min(step, f->max_step_size(x0, x1));
++				{ polysolve::cl::Scope cl_s(std::string("form.") + f->name() + ".max_step", 1); step = std::min(step, f->max_step_size(x0, x1)); }
+ 		return step;
+ 	}
+ 
+ 	bool FullNLProblem::is_step_valid(const TVector &x0, const TVector &x1)
+ 	{
+ 		for (auto &f : forms_)
+-			if (f->enabled() && !f->is_step_valid(x0, x1))
+-				return false;
++			if (f->enabled())
++			{
++				bool ok;
++				{ polysolve::cl::Scope cl_s(std::string("form.") + f->name() + ".step_valid", 1); ok = f->is_step_valid(x0, x1); }
++				if (!ok)
++					return false;
++			}
+ 		return true;
+ 	}
+ 
+ 	bool FullNLProblem::is_step_collision_free(const TVector &x0, const TVector &x1)
+ 	{
+ 		for (auto &f : forms_)
+-			if (f->enabled() && !f->is_step_collision_free(x0, x1))
+-				return false;
++			if (f->enabled())
++			{
++				bool ok;
++				{ polysolve::cl::Scope cl_s(std::string("form.") + f->name() + ".collision_free", 1); ok = f->is_step_collision_free(x0, x1); }
++				if (!ok)
++					return false;
++			}
+ 		return true;
+ 	}
+ 
+@@ -105,7 +134,7 @@
+ 		double val = 0;
+ 		for (auto &f : forms_)
+ 			if (f->enabled())
+-				val += f->value(x);
++				{ polysolve::cl::Scope cl_s(std::string("form.") + f->name() + ".value", cl_form_units(f)); val += f->value(x); }
+ 		return val;
+ 	}
+ 
+@@ -117,8 +146,11 @@
+ 			if (!f->enabled())
+ 				continue;
+ 			TVector tmp;
+-			f->first_derivative(x, tmp);
+-			grad += tmp;
++			{ polysolve::cl::Scope cl_s(std::string("form.") + f->name() + ".grad", cl_form_units(f)); f->first_derivative(x, tmp); }
++			{
++				polysolve::cl::Scope cl_a("FNL.sum", double(x.size()));
++				grad += tmp;
++			}
+ 		}
+ 	}
+ 
+@@ -130,20 +162,23 @@
+ 			if (!f->enabled())
+ 				continue;
+ 			THessian tmp;
+-			f->second_derivative(x, tmp);
+-			hessian += tmp;
++			{ polysolve::cl::Scope cl_s(std::string("form.") + f->name() + (polysolve::cl::proj_flag() ? ".hess.psd" : ".hess"), cl_form_units(f)); f->second_derivative(x, tmp); }
++			{
++				polysolve::cl::Scope cl_a("FNL.hess_sum", double(tmp.nonZeros()));
++				hessian += tmp;
++			}
+ 		}
+ 	}
+ 
+ 	void FullNLProblem::solution_changed(const TVector &x)
+ 	{
+ 		for (auto &f : forms_)
+-			f->solution_changed(x);
++			{ polysolve::cl::Scope cl_s(std::string("form.") + f->name() + ".solution_changed", 1); f->solution_changed(x); }
+ 	}
+ 
+ 	void FullNLProblem::post_step(const polysolve::nonlinear::PostStepData &data)
+ 	{
+ 		for (auto &f : forms_)
+-			f->post_step(data);
++			{ polysolve::cl::Scope cl_s(std::string("form.") + f->name() + ".post_step", 1); f->post_step(data); }
+ 	}
+ } // namespace polyfem::solver
+diff -ruN pf_orig/src/polyfem/solver/NLProblem.cpp pf/src/polyfem/solver/NLProblem.cpp
+--- pf_orig/src/polyfem/solver/NLProblem.cpp	2026-11-22 23:57:28.360160158 -0500
++++ pf/src/polyfem/solver/NLProblem.cpp	2026-11-23 17:09:58.154717277 -0500
+@@ -1,4 +1,6 @@
+ #include "NLProblem.hpp"
++#include <polysolve/ClTime.hpp> // export build
++#include <polyfem/solver/nonsmooth/blind/BlindUnitTerm.hpp>
+ 
+ #include <polyfem/solver/NonsmoothTerm.hpp>
+ #include <polyfem/solver/forms/lagrangian/BCLagrangianForm.hpp>
+@@ -41,6 +43,29 @@
+ 
+ namespace polyfem::solver
+ {
++	namespace
++	{
++		/// export build: the work units of the nonsmooth term's operations (collision pairs, plus the exact elements of the blind selection) and of its smooth part (the elements that are not exact; 0 = per call)
++		double cl_term_units(const std::shared_ptr<NonsmoothTerm> &t)
++		{
++			if (!t)
++				return 0;
++			double u = double(t->active_size());
++			if (auto *b = dynamic_cast<BlindUnitTerm *>(t.get()))
++				u += b->cl_exact_count();
++			return u;
++		}
++		double cl_smooth_units(const std::shared_ptr<NonsmoothTerm> &t)
++		{
++			if (auto *b = dynamic_cast<BlindUnitTerm *>(t.get()))
++				return b->cl_smooth_units();
++			return 0;
++		}
++	} // namespace
++} // namespace polyfem::solver
++
++namespace polyfem::solver
++{
+ 
+ 	namespace
+ 	{
+@@ -597,6 +622,7 @@
+ 
+ 	void NLProblem::line_search_begin(const TVector &x0, const TVector &x1)
+ 	{
++		polysolve::cl::Scope cl_s("NL.line_search_begin");
+ 		FullNLProblem::line_search_begin(reduced_to_full(x0), reduced_to_full(x1));
+ 
+ 		if (penalty_problem_ && full_size() == current_size())
+@@ -605,6 +631,7 @@
+ 
+ 	double NLProblem::max_step_size(const TVector &x0, const TVector &x1)
+ 	{
++		polysolve::cl::Scope cl_s("NL.max_step_size");
+ 		double max_step;
+ 		// certified narrow phase on a segment with cached candidates (same result as the forms' max_step_size)
+ 		if (has_nonsmooth_term() && nonsmooth_term_->certified_max_step_size())
+@@ -620,6 +647,7 @@
+ 
+ 	bool NLProblem::is_step_valid(const TVector &x0, const TVector &x1)
+ 	{
++		polysolve::cl::Scope cl_s("NL.is_step_valid");
+ 		bool valid = FullNLProblem::is_step_valid(reduced_to_full(x0), reduced_to_full(x1));
+ 
+ 		if (penalty_problem_ && valid && full_size() == current_size())
+@@ -630,6 +658,7 @@
+ 
+ 	bool NLProblem::is_step_collision_free(const TVector &x0, const TVector &x1)
+ 	{
++		polysolve::cl::Scope cl_s("NL.is_step_collision_free");
+ 		bool free = FullNLProblem::is_step_collision_free(reduced_to_full(x0), reduced_to_full(x1));
+ 
+ 		if (penalty_problem_ && free && full_size() == current_size())
+@@ -640,6 +669,7 @@
+ 
+ 	double NLProblem::value(const TVector &x)
+ 	{
++		polysolve::cl::Scope cl_s("NL.value");
+ 		if (is_residual())
+ 		{
+ 			TVector residual;
+@@ -660,6 +690,7 @@
+ 
+ 	void NLProblem::gradient(const TVector &x, TVector &grad)
+ 	{
++		polysolve::cl::Scope cl_s("NL.gradient");
+ 		FullNLProblem::gradient(reduced_to_full(x), grad);
+ 
+ 		if (full_size() != current_size())
+@@ -679,6 +710,7 @@
+ 
+ 	void NLProblem::hessian(const TVector &x, THessian &hessian)
+ 	{
++		polysolve::cl::Scope cl_s(polysolve::cl::proj_flag() ? "NL.hessian.psd" : "NL.hessian");
+ 		FullNLProblem::hessian(reduced_to_full(x), hessian);
+ 
+ 		if (full_size() != current_size())
+@@ -713,6 +745,7 @@
+ 
+ 	void NLProblem::solution_changed(const TVector &newX)
+ 	{
++		polysolve::cl::Scope cl_s("NL.solution_changed");
+ 		FullNLProblem::solution_changed(reduced_to_full(newX));
+ 
+ 		if (penalty_problem_ && full_size() == current_size())
+@@ -721,6 +754,7 @@
+ 
+ 	void NLProblem::post_step(const polysolve::nonlinear::PostStepData &data)
+ 	{
++		polysolve::cl::Scope cl_s("NL.post_step");
+ 		FullNLProblem::post_step(polysolve::nonlinear::PostStepData(data.iter_num, data.solver_info, reduced_to_full(data.x), reduced_to_full(data.grad)));
+ 
+ 		if (penalty_problem_ && full_size() == current_size())
+@@ -742,6 +776,7 @@
+ 
+ 	NLProblem::TVector NLProblem::full_to_reduced(const TVector &full) const
+ 	{
++		polysolve::cl::Scope cl_s("NL.full_to_reduced", double(full.size()));
+ 		// Reduced is already at the full size
+ 		if (full_size() == current_size() || full.size() == current_size())
+ 		{
+@@ -764,6 +799,7 @@
+ 
+ 	NLProblem::TVector NLProblem::full_to_reduced_grad(const TVector &full) const
+ 	{
++		polysolve::cl::Scope cl_s("NL.full_to_reduced", double(full.size()));
+ 		TVector grad = full;
+ 		if (penalty_forms_.size() == 1 && penalty_forms_.front()->can_project())
+ 			penalty_forms_.front()->project_gradient(grad);
+@@ -845,6 +881,7 @@
+ 
+ 	NLProblem::TVector NLProblem::reduced_to_full(const TVector &reduced) const
+ 	{
++		polysolve::cl::Scope cl_s("NL.reduced_to_full", double(reduced.size()));
+ 		// Full is already at the reduced size
+ 		if (full_size() == current_size() || full_size() == reduced.size())
+ 		{
+@@ -912,16 +949,18 @@
+ 		return *nonsmooth_term_;
+ 	}
+ 
+-	void NLProblem::smooth_gradient(const TVector &x, TVector &grad) { term().smooth_gradient(x, grad); }
+-	void NLProblem::smooth_hessian(const TVector &x, const bool project_to_psd, THessian &hessian) { term().smooth_hessian(x, project_to_psd, hessian); }
+-	double NLProblem::smooth_valid_fraction(const TVector &x, const TVector &a, const TVector &b) { return term().smooth_valid_fraction(x, a, b); }
++	void NLProblem::smooth_gradient(const TVector &x, TVector &grad) { polysolve::cl::Scope cl_s("NT.smooth_gradient", cl_smooth_units(nonsmooth_term_)); term().smooth_gradient(x, grad); }
++	void NLProblem::smooth_hessian(const TVector &x, const bool project_to_psd, THessian &hessian) { polysolve::cl::Scope cl_s(project_to_psd ? "NT.smooth_hessian.psd" : "NT.smooth_hessian", cl_smooth_units(nonsmooth_term_)); term().smooth_hessian(x, project_to_psd, hessian); }
++	double NLProblem::smooth_valid_fraction(const TVector &x, const TVector &a, const TVector &b) { polysolve::cl::Scope cl_s("NT.smooth_valid_fraction"); return term().smooth_valid_fraction(x, a, b); }
+ 	double NLProblem::smooth_min_jacobian(const TVector &x)
+ 	{
++		polysolve::cl::Scope cl_s("NT.min_jacobian");
+ 		return has_nonsmooth_term() ? term().min_jacobian(x) : std::numeric_limits<double>::quiet_NaN();
+ 	}
+ 
+ 	void NLProblem::smooth_min_jacobians(const TVector &x, const TVector &y, const bool want_min, const bool want_ratio, double &min_j, double &min_ratio)
+ 	{
++		polysolve::cl::Scope cl_s("NT.min_jacobians");
+ 		if (!has_nonsmooth_term())
+ 		{
+ 			min_j = min_ratio = std::numeric_limits<double>::quiet_NaN();
+@@ -930,18 +969,18 @@
+ 		term().min_jacobians(x, y, want_min, want_ratio, min_j, min_ratio);
+ 	}
+ 
+-	void NLProblem::metric_diagonal(TVector &diag) { term().metric_diagonal(diag); }
+-	void NLProblem::nonsmooth_update(const TVector &y) { term().update(y); }
+-	double NLProblem::nonsmooth_value(const TVector &y) { return term().value(y); }
+-	void NLProblem::nonsmooth_gradient(const TVector &y, TVector &grad) { term().gradient(y, grad); }
+-	void NLProblem::nonsmooth_hessian(const TVector &y, const bool project_to_psd, THessian &hessian) { term().hessian(y, project_to_psd, hessian); }
+-	bool NLProblem::nonsmooth_hessian_blocks(const TVector &y, TVector &grad, std::vector<polysolve::nonlinear::HessianBlock> &blocks) { return term().hessian_blocks(y, grad, blocks); }
+-	int NLProblem::nonsmooth_active_size() { return term().active_size(); }
+-	void NLProblem::nonsmooth_active_distances(const TVector &a, const TVector &b, TVector &distance, TVector &rate) { term().active_distances(a, b, distance, rate); }
+-	double NLProblem::nonsmooth_step_length(const TVector &a, const TVector &b) { return term().step_length(a, b); }
++	void NLProblem::metric_diagonal(TVector &diag) { polysolve::cl::Scope cl_s("NT.metric_diagonal"); term().metric_diagonal(diag); }
++	void NLProblem::nonsmooth_update(const TVector &y) { polysolve::cl::Scope cl_s("NT.update"); term().update(y); }
++	double NLProblem::nonsmooth_value(const TVector &y) { polysolve::cl::Scope cl_s("NT.value", cl_term_units(nonsmooth_term_)); return term().value(y); }
++	void NLProblem::nonsmooth_gradient(const TVector &y, TVector &grad) { polysolve::cl::Scope cl_s("NT.gradient", cl_term_units(nonsmooth_term_)); term().gradient(y, grad); }
++	void NLProblem::nonsmooth_hessian(const TVector &y, const bool project_to_psd, THessian &hessian) { polysolve::cl::Scope cl_s(project_to_psd ? "NT.hessian.psd" : "NT.hessian", cl_term_units(nonsmooth_term_)); term().hessian(y, project_to_psd, hessian); }
++	bool NLProblem::nonsmooth_hessian_blocks(const TVector &y, TVector &grad, std::vector<polysolve::nonlinear::HessianBlock> &blocks) { polysolve::cl::Scope cl_s("NT.hessian_blocks", cl_term_units(nonsmooth_term_)); return term().hessian_blocks(y, grad, blocks); }
++	int NLProblem::nonsmooth_active_size() { polysolve::cl::Scope cl_s("NT.active_size"); return term().active_size(); }
++	void NLProblem::nonsmooth_active_distances(const TVector &a, const TVector &b, TVector &distance, TVector &rate) { polysolve::cl::Scope cl_s("NT.active_distances", cl_term_units(nonsmooth_term_)); term().active_distances(a, b, distance, rate); }
++	double NLProblem::nonsmooth_step_length(const TVector &a, const TVector &b) { polysolve::cl::Scope cl_s("NT.step_length"); return term().step_length(a, b); }
+ 	double NLProblem::nonsmooth_length_scale() { return term().length_scale(); }
+ 	double NLProblem::nonsmooth_activation_distance() { return term().activation_distance(); }
+-	void NLProblem::nonsmooth_segment_begin(const TVector &a, const TVector &b) { term().segment_begin(a, b); }
++	void NLProblem::nonsmooth_segment_begin(const TVector &a, const TVector &b) { polysolve::cl::Scope cl_s("NT.segment_begin"); term().segment_begin(a, b); }
+ 
+ 	polysolve::nonlinear::FirstLayerPort *NLProblem::nonsmooth_first_layer() { return nonsmooth_term_ ? nonsmooth_term_->first_layer() : nullptr; }
+ 	polysolve::nonlinear::SelectionPort *NLProblem::nonsmooth_selection() { return nonsmooth_term_ ? nonsmooth_term_->selection() : nullptr; }
+@@ -951,4 +990,12 @@
+ 		if (nonsmooth_term_)
+ 			nonsmooth_term_->step_accepted(x0, x1);
+ 	}
++
++	// export build
++	bool NLProblem::nonsmooth_cl_block_kinds(std::vector<int> &kinds) { return nonsmooth_term_ && nonsmooth_term_->cl_block_kinds(kinds); }
++	long NLProblem::nonsmooth_cl_export_elem(const TVector &y, const std::string &file, const long step, const long outer, const long point)
++	{
++		return nonsmooth_term_ ? nonsmooth_term_->cl_export_elem(reduced_to_full(y), file, step, outer, point) : -1;
++	}
++	bool NLProblem::nonsmooth_cl_export_mesh(const std::string &file) { return nonsmooth_term_ && nonsmooth_term_->cl_export_mesh(file); }
+ } // namespace polyfem::solver
+diff -ruN pf_orig/src/polyfem/solver/NLProblem.hpp pf/src/polyfem/solver/NLProblem.hpp
+--- pf_orig/src/polyfem/solver/NLProblem.hpp	2026-11-22 23:57:21.751490160 -0500
++++ pf/src/polyfem/solver/NLProblem.hpp	2026-11-23 12:59:32.002221924 -0500
+@@ -138,6 +138,10 @@
+ 		polysolve::nonlinear::SelectionPort *nonsmooth_selection() override;
+ 		polysolve::nonlinear::BasisPort *nonsmooth_basis() override;
+ 		void nonsmooth_step_accepted(const TVector &x0, const TVector &x1) override;
++		// export build
++		bool nonsmooth_cl_block_kinds(std::vector<int> &kinds) override;
++		long nonsmooth_cl_export_elem(const TVector &y, const std::string &file, const long step, const long outer, const long point) override;
++		bool nonsmooth_cl_export_mesh(const std::string &file) override;
+ 
+ 		virtual double grad_norm_rescaling(const polysolve::nonlinear::NormType norm_type) const override;
+ 		virtual double step_norm_rescaling(const polysolve::nonlinear::NormType norm_type) const override;
+diff -ruN pf_orig/src/polyfem/solver/NonsmoothTerm.hpp pf/src/polyfem/solver/NonsmoothTerm.hpp
+--- pf_orig/src/polyfem/solver/NonsmoothTerm.hpp	2026-11-22 23:57:21.750384576 -0500
++++ pf/src/polyfem/solver/NonsmoothTerm.hpp	2026-11-23 12:59:32.001816215 -0500
+@@ -9,6 +9,7 @@
+ #include <Eigen/Core>
+ #include <Eigen/Sparse>
+ 
++#include <string>
+ #include <vector>
+ 
+ namespace polyfem::solver
+@@ -68,6 +69,11 @@
+ 		/// @brief The solver accepted the step x0 -> x1 (the term is at x1)
+ 		virtual void step_accepted(const Eigen::VectorXd &x0, const Eigen::VectorXd &x1) {}
+ 
++		/// @brief EXPORT BUILD: the kind of each block of the last hessian_blocks (0 element, 1 ee, 2 fv, 3 ev, 4 vv, 5 other), the exact elastic elements at xfull (CLELM001), the collision mesh (CLCMSH01)
++		virtual bool cl_block_kinds(std::vector<int> &kinds) const { return false; }
++		virtual long cl_export_elem(const Eigen::VectorXd &xfull, const std::string &file, const long step, const long outer, const long point) { return -1; }
++		virtual bool cl_export_mesh(const std::string &file) const { return false; }
++
+ 		/// @brief Ports of the strategy; null where the implementation has no such part
+ 		virtual polysolve::nonlinear::FirstLayerPort *first_layer() { return nullptr; }
+ 		virtual polysolve::nonlinear::SelectionPort *selection() { return nullptr; }
+diff -ruN pf_orig/src/polyfem/solver/forms/BarrierContactForm.cpp pf/src/polyfem/solver/forms/BarrierContactForm.cpp
+--- pf_orig/src/polyfem/solver/forms/BarrierContactForm.cpp	2026-10-28 13:04:38.132793178 -0400
++++ pf/src/polyfem/solver/forms/BarrierContactForm.cpp	2026-11-23 17:09:58.153539929 -0500
+@@ -1,4 +1,5 @@
+ #include "BarrierContactForm.hpp"
++#include <polysolve/ClTime.hpp> // export build
+ 
+ #include <polyfem/utils/Logger.hpp>
+ #include <polyfem/utils/MaybeParallelFor.hpp>
+@@ -117,13 +118,30 @@
+ 		if (cached_displaced_surface_.size() == displaced_surface.size() && cached_displaced_surface_ == displaced_surface)
+ 			return;
+ 
+-		if (use_cached_candidates_)
+-			collision_set_.build(
+-				candidates_, collision_mesh_, displaced_surface, dhat_);
+-		else
+-			collision_set_.build(
+-				collision_mesh_, displaced_surface, dhat_, dmin_, broad_phase_.get());
++		const long long cl_t0 = polysolve::cl::any() ? polysolve::cl::cpu_ns() : 0; // export build
++		{
++			polysolve::cl::Scope cl_b("C3.build"); // export build: the collision-set build itself, whoever asks for it
++			if (use_cached_candidates_)
++				collision_set_.build(
++					candidates_, collision_mesh_, displaced_surface, dhat_);
++			else
++				collision_set_.build(
++					collision_mesh_, displaced_surface, dhat_, dmin_, broad_phase_.get());
++		}
+ 		cached_displaced_surface_ = displaced_surface;
++		if (polysolve::cl::any())
++		{
++			polysolve::cl::Scope cl_hook("X.hook");
++			// export build: the collision-set build (from the cached candidates of the segment, or with its own broad phase)
++			const long long ns = polysolve::cl::cpu_ns() - cl_t0;
++			auto &cx = polysolve::cl::ctx();
++			polysolve::cl::put({{"t", "ccd"}, {"kind", "collisions"}, {"step", cx.step}, {"outer", cx.outer}, {"seq", cx.ccd_seq++}, {"nv", long(collision_mesh_.num_vertices())}, {"calls", 1},
++								{"cached", use_cached_candidates_}, {"ncand_in", use_cached_candidates_ ? long(candidates_.size()) : 0L},
++								{"cand", {{"vv", long(collision_set_.vv_collisions.size())}, {"ev", long(collision_set_.ev_collisions.size())}, {"ee", long(collision_set_.ee_collisions.size())}, {"fv", long(collision_set_.fv_collisions.size())}}},
++								{"cpu_ns", ns}});
++			if (!use_cached_candidates_) // the builds from cached candidates are priced from the candidates of the segment (kind 0 records)
++				cl_export_surf(1, displaced_surface, nullptr, 0.0, long(collision_set_.size()), ns, nullptr, "own");
++		}
+ 	}
+ 
+ 	double BarrierContactForm::value_unweighted(const Eigen::VectorXd &x) const
+diff -ruN pf_orig/src/polyfem/solver/forms/ContactForm.cpp pf/src/polyfem/solver/forms/ContactForm.cpp
+--- pf_orig/src/polyfem/solver/forms/ContactForm.cpp	2026-11-13 14:51:13.240693326 -0500
++++ pf/src/polyfem/solver/forms/ContactForm.cpp	2026-11-23 17:09:58.153290878 -0500
+@@ -1,4 +1,5 @@
+ #include "ContactForm.hpp"
++#include <polysolve/ClTime.hpp> // export build
+ 
+ #include <polyfem/solver/NLProblem.hpp>
+ #include <polyfem/solver/forms/FrictionForm.hpp>
+@@ -57,8 +58,12 @@
+ 
+ 	Eigen::MatrixXd ContactForm::compute_displaced_surface(const Eigen::VectorXd &x) const
+ 	{
++		polysolve::cl::Scope cl_s("CC.displace", double(collision_mesh_.num_vertices())); // export build
+ 		// the CCD, the broad phase and the NonsmoothNewton term map the same points many times: the last results are kept
+-		return displaced_cache_.get(x, [&]() { return collision_mesh_.displace_vertices(utils::unflatten(x, collision_mesh_.dim())); });
++		return displaced_cache_.get(x, [&]() {
++			polysolve::cl::Scope cl_m("CC.displace_miss", double(collision_mesh_.num_vertices())); // export build: the points were not in the cache
++			return collision_mesh_.displace_vertices(utils::unflatten(x, collision_mesh_.dim()));
++		});
+ 	}
+ 
+ 	void ContactForm::solution_changed(const Eigen::VectorXd &new_x)
+@@ -68,6 +73,7 @@
+ 
+ 	double ContactForm::max_step_size(const Eigen::VectorXd &x0, const Eigen::VectorXd &x1) const
+ 	{
++		const long long cl_t0 = polysolve::cl::any() ? polysolve::cl::cpu_ns() : 0; // export build
+ 		// Extract surface only
+ 		const Eigen::MatrixXd V0 = compute_displaced_surface(x0);
+ 		const Eigen::MatrixXd V1 = compute_displaced_surface(x1);
+@@ -110,18 +116,123 @@
+ 		}
+ #endif
+ 
++		if (polysolve::cl::any())
++		{
++			polysolve::cl::Scope cl_hook("X.hook");
++			// export build: the narrow phase of the stock path (Tight Inclusion on all candidates)
++			const long long ns = polysolve::cl::cpu_ns() - cl_t0;
++			const bool uc = use_cached_candidates_;
++			auto &cx = polysolve::cl::ctx();
++			polysolve::cl::put({{"t", "ccd"}, {"kind", "narrow"}, {"path", "stock"}, {"step", cx.step}, {"outer", cx.outer}, {"seq", cx.ccd_seq++}, {"nv", long(collision_mesh_.num_vertices())}, {"calls", 1}, {"cached", uc},
++								{"cand", {{"vv", uc ? long(candidates_.vv_candidates.size()) : 0L}, {"ev", uc ? long(candidates_.ev_candidates.size()) : 0L}, {"ee", uc ? long(candidates_.ee_candidates.size()) : 0L}, {"fv", uc ? long(candidates_.fv_candidates.size()) : 0L}}},
++								{"cpu_ns", ns}});
++			cl_export_surf(0, V0, &V1, max_step, uc ? long(candidates_.size()) : 0L, ns, nullptr, "stock");
++		}
+ 		return max_step;
+ 	}
+ 
++	void ContactForm::cl_export_surf(const int kind, const Eigen::MatrixXd &V0, const Eigen::MatrixXd *V1, const double alpha, const long n_cand, const long long solver_ns,
++									 polysolve::cl::ExportItem *item, const std::string &narrow, const std::vector<polysolve::cl::TiQuery> *queries) const
++	{
++		auto &ex = polysolve::cl::exporter();
++		if (!ex.on)
++			return;
++		if (item == nullptr)
++			item = ex.offer(kind == 0 ? "surf_ccd" : "surf_coll");
++		if (item == nullptr)
++			return;
++		std::string path;
++		polysolve::cl::ExportSub &s = ex.sub(*item, "surf", path);
++		auto &cx = polysolve::cl::ctx();
++		s.kind = kind == 0 ? "ccd" : "coll";
++		s.step = cx.step;
++		s.outer = cx.outer;
++		s.point = cx.point;
++		s.n = long(V0.rows());
++		s.solver_ns = solver_ns;
++		s.extra = (kind == 0 ? "narrow=" : "build=") + narrow;
++		{
++			polysolve::cl::BinOut o(path);
++			if (!o.ok())
++				return;
++			o.magic("CLSURF01");
++			o.i64(kind);
++			o.i64(V0.rows());
++			o.i64((long long)int(broad_phase_method_));
++			o.i64(use_cached_candidates_ ? 1 : 0);
++			o.i64(tight_inclusion_ccd_.max_iterations);
++			o.i64(n_cand);
++			o.i64(cx.step);
++			o.i64(cx.outer);
++			o.i64(cx.point);
++			o.f64(dhat_);
++			o.f64(dmin_);
++			o.f64(barrier_support_size() / 2);
++			o.f64(tight_inclusion_ccd_.tolerance);
++			o.f64(alpha);
++			for (Eigen::Index i = 0; i < V0.rows(); ++i)
++				for (int d = 0; d < 3; ++d)
++					o.f64(d < V0.cols() ? V0(i, d) : 0.0);
++			if (kind == 0 && V1 != nullptr)
++				for (Eigen::Index i = 0; i < V1->rows(); ++i)
++					for (int d = 0; d < 3; ++d)
++						o.f64(d < V1->cols() ? (*V1)(i, d) : 0.0);
++		}
++		if (queries != nullptr)
++		{
++			std::string tpath;
++			polysolve::cl::ExportSub &t = ex.sub(*item, "tiq", tpath);
++			t.kind = "-";
++			t.step = cx.step;
++			t.outer = cx.outer;
++			t.point = cx.point;
++			t.n = long(queries->size());
++			t.solver_ns = solver_ns;
++			polysolve::cl::BinOut o(tpath);
++			if (!o.ok())
++				return;
++			o.magic("CLTIQ001");
++			o.i64((long long)queries->size());
++			o.i64(cx.step);
++			o.i64(cx.outer);
++			o.i64(cx.point);
++			o.i64(tight_inclusion_ccd_.max_iterations);
++			o.f64(tight_inclusion_ccd_.tolerance);
++			o.f64(0.0); // the min_distance of the certified narrow phase
++			for (const polysolve::cl::TiQuery &q : *queries)
++			{
++				o.i32(q.family);
++				o.i32(q.nv);
++				o.f64(q.tmax);
++				o.f64v(q.xa, 12);
++				o.f64v(q.xb, 12);
++			}
++		}
++	}
++
+ 	void ContactForm::line_search_begin(const Eigen::VectorXd &x0, const Eigen::VectorXd &x1)
+ 	{
+-		candidates_.build(
+-			collision_mesh_,
+-			compute_displaced_surface(x0),
+-			compute_displaced_surface(x1),
+-			/*inflation_radius=*/barrier_support_size() / 2,
+-			broad_phase_.get());
++		const long long cl_t0 = polysolve::cl::any() ? polysolve::cl::cpu_ns() : 0; // export build
++		const Eigen::MatrixXd cl_V0 = compute_displaced_surface(x0), cl_V1 = compute_displaced_surface(x1);
++		{
++			polysolve::cl::Scope cl_b("C1.build"); // export build: the broad phase itself (Candidates::build)
++			candidates_.build(
++				collision_mesh_,
++				cl_V0,
++				cl_V1,
++				/*inflation_radius=*/barrier_support_size() / 2,
++				broad_phase_.get());
++		}
+ 
++		if (polysolve::cl::on())
++		{
++			polysolve::cl::Scope cl_hook("X.hook");
++			// export build: the broad phase of the segment
++			auto &cx = polysolve::cl::ctx();
++			polysolve::cl::put({{"t", "ccd"}, {"kind", "broad"}, {"step", cx.step}, {"outer", cx.outer}, {"seq", cx.ccd_seq++}, {"nv", long(collision_mesh_.num_vertices())}, {"calls", 1},
++								{"cand", {{"vv", long(candidates_.vv_candidates.size())}, {"ev", long(candidates_.ev_candidates.size())}, {"ee", long(candidates_.ee_candidates.size())}, {"fv", long(candidates_.fv_candidates.size())}}},
++								{"cpu_ns", polysolve::cl::cpu_ns() - cl_t0}});
++		}
+ 		use_cached_candidates_ = true;
+ 	}
+ 
+diff -ruN pf_orig/src/polyfem/solver/forms/ContactForm.hpp pf/src/polyfem/solver/forms/ContactForm.hpp
+--- pf_orig/src/polyfem/solver/forms/ContactForm.hpp	2026-11-13 14:51:13.241070297 -0500
++++ pf/src/polyfem/solver/forms/ContactForm.hpp	2026-11-23 13:00:34.868807561 -0500
+@@ -6,6 +6,8 @@
+ #include <polyfem/utils/ExactMapCache.hpp>
+ #include <polyfem/utils/Types.hpp>
+ 
++#include <polysolve/ClExport.hpp> // export build
++
+ #include <ipc/collisions/normal/normal_collisions.hpp>
+ #include <ipc/collision_mesh.hpp>
+ #include <ipc/broad_phase/create_broad_phase.hpp>
+@@ -129,6 +131,11 @@
+ 		/// @brief Tight Inclusion CCD object used by max_step_size
+ 		const ipc::TightInclusionCCD &tight_inclusion_ccd() const { return tight_inclusion_ccd_; }
+ 
++		/// @brief EXPORT BUILD: the CLSURF01 record of a CCD call (kind 0: V0 and V1 of the segment) or of a collision-set build (kind 1: V0), and the TI queries (CLTIQ001) of a
++		/// certified narrow phase; item: the export item the caller offered (null: offered here); narrow: "stock", "cert" or "none"
++		void cl_export_surf(const int kind, const Eigen::MatrixXd &V0, const Eigen::MatrixXd *V1, const double alpha, const long n_cand, const long long solver_ns,
++							polysolve::cl::ExportItem *item = nullptr, const std::string &narrow = "none", const std::vector<polysolve::cl::TiQuery> *queries = nullptr) const;
++
+ 	protected:
+ 		/// @brief Update the cached candidate set for the current solution
+ 		/// @param displaced_surface Vertex positions displaced by the current solution
+diff -ruN pf_orig/src/polyfem/solver/forms/ElasticForm.cpp pf/src/polyfem/solver/forms/ElasticForm.cpp
+--- pf_orig/src/polyfem/solver/forms/ElasticForm.cpp	2026-11-23 11:42:00.466627546 -0500
++++ pf/src/polyfem/solver/forms/ElasticForm.cpp	2026-11-23 12:59:31.999255929 -0500
+@@ -799,6 +799,31 @@
+ 		hessian = Eigen::Map<const StiffnessMatrix>(D.ndof, D.ndof, StiffnessMatrix::StorageIndex(nnz), D.outer.data(), D.inner.data(), sum->v.data());
+ 	}
+ 
++	bool ElasticForm::cl_elements(const std::vector<int> &ids, const Eigen::VectorXd &x, std::vector<double> &B, std::vector<double> &lambda, std::vector<double> &mu, std::vector<double> &da, std::vector<double> &u) const
++	{
++		if (!fast_active())
++			return false;
++		const size_t ne = ids.size();
++		B.assign(ne * 12, 0.0);
++		u.assign(ne * 12, 0.0);
++		lambda.assign(ne, 0.0);
++		mu.assign(ne, 0.0);
++		da.assign(ne, 0.0);
++		for (size_t k = 0; k < ne; ++k)
++		{
++			const fastp1::Elem &el = fast_->el[ids[k]];
++			for (int i = 0; i < 12; ++i)
++			{
++				B[k * 12 + i] = el.B[i];
++				u[k * 12 + i] = el.dofs[i] >= 0 ? x[el.dofs[i]] : 0.0;
++			}
++			lambda[k] = el.lambda;
++			mu[k] = el.mu;
++			da[k] = el.da;
++		}
++		return true;
++	}
++
+ 	void ElasticForm::finish()
+ 	{
+ 		for (auto &t : quadrature_hierarchy_)
+diff -ruN pf_orig/src/polyfem/solver/forms/ElasticForm.hpp pf/src/polyfem/solver/forms/ElasticForm.hpp
+--- pf_orig/src/polyfem/solver/forms/ElasticForm.hpp	2026-11-23 11:15:05.612416133 -0500
++++ pf/src/polyfem/solver/forms/ElasticForm.hpp	2026-11-23 12:59:31.998446323 -0500
+@@ -126,6 +126,9 @@
+ 		void element_local(const Eigen::MatrixXd &x, const int e, const bool with_hessian, const bool with_energy,
+ 						   assembler::ElementAssemblyValues &vals, ElementLocal &out) const;
+ 
++		/// @brief EXPORT BUILD: the closed-form kernel's data of the elements ids (B, lambda, mu, da, the displacement x of their 12 local dofs); false without the kernel
++		bool cl_elements(const std::vector<int> &ids, const Eigen::VectorXd &x, std::vector<double> &B, std::vector<double> &lambda, std::vector<double> &mu, std::vector<double> &da, std::vector<double> &u) const;
++
+ 		/// @brief Value (weighted and scaled like the form) of the elements ids only
+ 		double subset_energy(const Eigen::VectorXd &x, const std::vector<int> &ids) const;
+ 		/// @brief Gradient (full dofs, weighted and scaled like the form) of the elements ids only
+diff -ruN pf_orig/src/polyfem/solver/nonsmooth/blind/BlindUnitTerm.cpp pf/src/polyfem/solver/nonsmooth/blind/BlindUnitTerm.cpp
+--- pf_orig/src/polyfem/solver/nonsmooth/blind/BlindUnitTerm.cpp	2026-11-23 11:52:30.729498029 -0500
++++ pf/src/polyfem/solver/nonsmooth/blind/BlindUnitTerm.cpp	2026-11-23 17:31:04.700593642 -0500
+@@ -10,6 +10,8 @@
+ #include <polyfem/utils/Logger.hpp>
+ #include <polyfem/utils/MaybeParallelFor.hpp>
+ 
++#include <polysolve/ClExport.hpp> // export build
++#include <polysolve/ClTime.hpp> // export build
+ #include <ipc/candidates/candidates.hpp>
+ #include <ipc/collision_mesh.hpp>
+ #include <ipc/potentials/barrier_potential.hpp>
+@@ -398,6 +400,7 @@
+ 		const std::vector<int> &ids = exact_elements();
+ 		if (!ids.empty())
+ 		{
++			polysolve::cl::Scope cl_ex("NT.exact_part", double(ids.size())); // export build: the exact elements leave the smooth part
+ 			// the exact elements leave the smooth part
+ 			Vec gs;
+ 			if (cache.cur_has(xfull, true))
+@@ -469,6 +472,7 @@
+ 		const std::vector<int> &ids = exact_elements();
+ 		if (!ids.empty())
+ 		{
++			polysolve::cl::Scope cl_ex("NT.exact_part", double(ids.size())); // export build: the exact elements leave the smooth part
+ 			StiffnessMatrix hs;
+ 			if (cache.cur_has(xfull, false))
+ 			{
+@@ -843,9 +847,30 @@
+ 				if (const int r = b.indices[j]; r >= 0)
+ 					grad[r] += gb[i][j];
+ 		}
++		if (polysolve::cl::any())
++		{
++			polysolve::cl::Scope cl_hook("X.hook");
++			// export build: the kind of each block (the exact collisions by type, friction, then the exact elements)
++			cl_kinds_.assign(blocks.size(), 0);
++			for (size_t i = 0; i < nb; ++i)
++			{
++				const size_t ci = size_t(bidx[i]);
++				cl_kinds_[i] = cs.is_edge_edge(ci) ? 1 : cs.is_face_vertex(ci) ? 2 : cs.is_edge_vertex(ci) ? 3 : cs.is_vertex_vertex(ci) ? 4 : 5;
++			}
++			for (size_t i = 0; i < nf; ++i)
++				cl_kinds_[nb + i] = 5;
++		}
+ 		return true;
+ 	}
+ 
++	double BlindUnitTerm::cl_exact_count() { return double(exact_elements().size()); }
++	double BlindUnitTerm::cl_smooth_units() { return double(elastic_->n_elements()) - double(exact_elements().size()); }
++
++	long BlindUnitTerm::cl_export_elem(const Vec &xfull, const std::string &file, const long step, const long outer, const long point)
++	{
++		return cl_write_elem(exact_elements(), xfull, file, step, outer, point);
++	}
++
+ 	// ------------------------------------------------------------------------------------------------------ born units
+ 	void BlindUnitTerm::step_accepted(const Vec &x0, const Vec &x1)
+ 	{
+diff -ruN pf_orig/src/polyfem/solver/nonsmooth/blind/BlindUnitTerm.hpp pf/src/polyfem/solver/nonsmooth/blind/BlindUnitTerm.hpp
+--- pf_orig/src/polyfem/solver/nonsmooth/blind/BlindUnitTerm.hpp	2026-11-23 11:52:30.729281281 -0500
++++ pf/src/polyfem/solver/nonsmooth/blind/BlindUnitTerm.hpp	2026-11-23 17:10:11.955625697 -0500
+@@ -42,6 +42,10 @@
+ 		void hessian(const Eigen::VectorXd &y, const bool project_to_psd, StiffnessMatrix &hessian) override;
+ 		bool hessian_blocks(const Eigen::VectorXd &y, Eigen::VectorXd &grad, std::vector<polysolve::nonlinear::HessianBlock> &blocks) override;
+ 		void step_accepted(const Eigen::VectorXd &x0, const Eigen::VectorXd &x1) override;
++		/// export build: the exact elastic elements, and the elements of the smooth part (the work units of the operations that depend on the exact set)
++		double cl_exact_count();
++		double cl_smooth_units();
++		long cl_export_elem(const Eigen::VectorXd &xfull, const std::string &file, const long step, const long outer, const long point) override; // export build
+ 
+ 		polysolve::nonlinear::FirstLayerPort *first_layer() override { return first_layer_blind_.get(); }
+ 		polysolve::nonlinear::SelectionPort *selection() override { return &port_; }
+diff -ruN pf_orig/src/polyfem/solver/nonsmooth/blind/UnitSelector.cpp pf/src/polyfem/solver/nonsmooth/blind/UnitSelector.cpp
+--- pf_orig/src/polyfem/solver/nonsmooth/blind/UnitSelector.cpp	2026-11-23 11:49:33.064310378 -0500
++++ pf/src/polyfem/solver/nonsmooth/blind/UnitSelector.cpp	2026-11-23 15:35:08.942271653 -0500
+@@ -8,6 +8,7 @@
+ #include <polyfem/utils/MaybeParallelFor.hpp>
+ 
+ #include <ipc/utils/eigen_ext.hpp>
++#include <polysolve/ClTime.hpp> // export build
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -99,6 +100,7 @@
+ 		cache.build_table(reeval ? prev_re : prev, T0);
+ 		cache.build_table(cur, T1);
+ 		const int n0 = T0.n;
++		polysolve::cl::timers().on && !polysolve::cl::timers().stack.empty() ? (void)(polysolve::cl::timers().stack.back().units += double(n0)) : (void)0; // export build: the work units of the selection
+ 		std::vector<char> isx(n0);
+ 		for (int u = 0; u < n0; ++u)
+ 			isx[u] = S_.in_S(T0.key[u]);
+diff -ruN pf_orig/src/polyfem/varforms/NonlinearElasticVarForm.cpp pf/src/polyfem/varforms/NonlinearElasticVarForm.cpp
+--- pf_orig/src/polyfem/varforms/NonlinearElasticVarForm.cpp	2026-11-23 11:48:42.870739479 -0500
++++ pf/src/polyfem/varforms/NonlinearElasticVarForm.cpp	2026-11-23 16:26:46.608406045 -0500
+@@ -51,6 +51,131 @@
+ 
+ #include <random>
+ 
++#include <polysolve/ClTime.hpp> // export build
++
++
++namespace polyfem::varform
++{
++	namespace
++	{
++		/// EXPORT BUILD: micro-benchmark of the problem-side operations of a solve (POLYFEM_CL_BENCH=<time step>), in isolation at the state of the start of that time step: every operation that the
++		/// strategy calls is repeated alone (>= 3 times, up to 0.25 s of thread CPU) and the exclusive thread CPU time of every category (polysolve/ClTime.hpp) is written as a `bench` row.
++		/// The unit prices of the estimate for these categories come from these rows, never from the run that is checked. Run it in a run of its own: it leaves the caches of the term touched.
++		void cl_bench(solver::NLProblem &P, const Eigen::VectorXd &x_full)
++		{
++			using polysolve::cl::cpu_ns;
++			polysolve::cl::Timers &T = polysolve::cl::timers();
++			if (!T.on || !P.has_nonsmooth_term())
++				return;
++			using Vec = Eigen::VectorXd;
++			const Vec x = P.full_to_reduced(x_full);
++			Vec g, g2;
++			P.solution_changed(x);
++			P.gradient(x, g);
++			const double h = P.nonsmooth_length_scale();
++			const double gm = g.cwiseAbs().maxCoeff();
++			const Vec y = x - g * (gm > 0 ? 0.05 * h / gm : 0.0); // a small step: the cost of the operations does not depend on its size
++			// the caches of the real run are somewhere between the hot caches of a repeated call and cold ones: every operation is repeated hot (back to back) and cold (a 48 MB sweep before every call);
++			// the estimate takes the geometric mean of the two prices
++			std::vector<char> sweep(48u << 20, 1);
++			volatile char sweep_sink = 0;
++			const auto evict = [&] {
++				char acc = 0;
++				for (size_t i = 0; i < sweep.size(); i += 64)
++					acc = char(acc + sweep[i]++);
++				sweep_sink = acc;
++			};
++			const auto bench = [&](const char *op, const std::function<void()> &fn) {
++				for (int i = 0; i < 2; ++i)
++					fn();
++				for (const bool cold : {false, true})
++				{
++					T.table.clear();
++					T.stack.clear();
++					long long inside = 0;
++					int reps = 0;
++					while (reps < 3 || (inside < 250000000LL && reps < 200))
++					{
++						if (cold)
++							evict();
++						const long long t0 = cpu_ns();
++						fn();
++						inside += cpu_ns() - t0;
++						++reps;
++					}
++					polysolve::json cats = polysolve::json::object();
++					for (const auto &kv : T.table)
++						cats[kv.first] = {{"ns", kv.second.ns}, {"calls", kv.second.calls}, {"units", kv.second.units}};
++					polysolve::cl::put({{"t", "bench"}, {"op", op}, {"mode", cold ? "cold" : "hot"}, {"reps", reps}, {"cats", cats}});
++					T.table.clear();
++					P.solution_changed(x);
++				}
++			};
++			StiffnessMatrix H;
++			std::vector<polysolve::nonlinear::HessianBlock> blocks;
++			double a = 0, b = 0;
++			Vec dist, rate, diag;
++			bench("value", [&] { P.value(x); });
++			bench("gradient", [&] { P.gradient(x, g2); });
++			bench("smooth_hessian", [&] { P.smooth_hessian(x, false, H); });
++			bench("smooth_hessian_psd", [&] { P.smooth_hessian(x, true, H); });
++			bench("smooth_gradient", [&] { P.smooth_gradient(x, g2); });
++			bench("nonsmooth_hessian", [&] { P.nonsmooth_hessian(x, false, H); });
++			bench("nonsmooth_hessian_psd", [&] { P.nonsmooth_hessian(x, true, H); });
++			bench("nonsmooth_gradient", [&] { P.nonsmooth_gradient(x, g2); });
++			bench("nonsmooth_value", [&] { P.nonsmooth_value(x); });
++			bench("nonsmooth_blocks", [&] { P.nonsmooth_hessian_blocks(x, g2, blocks); });
++			bench("min_jacobian", [&] { P.smooth_min_jacobian(x); });
++			// the anchor and the determinants at x are made again when x changes (once per outer iteration): the point alternates so that every call pays them, the categories NT.anchor and NT.jdets have their own prices
++			const Vec y_big = x + (y - x) * 10.0;
++			bool flip = false;
++			bench("min_jacobians", [&] {
++				flip = !flip;
++				P.smooth_min_jacobians(flip ? x : y, flip ? y : x, true, true, a, b);
++			});
++			bench("valid_fraction", [&] {
++				flip = !flip;
++				P.smooth_valid_fraction(flip ? x : y, flip ? x : y, flip ? y : x);
++			});
++			bench("valid_fraction_big", [&] {
++				flip = !flip;
++				P.smooth_valid_fraction(flip ? x : y, flip ? x : y, flip ? y_big : x);
++			});
++			bench("active", [&] {
++				P.nonsmooth_active_size();
++				P.nonsmooth_active_distances(x, y, dist, rate);
++				P.nonsmooth_step_length(x, y);
++			});
++			bench("metric", [&] { P.metric_diagonal(diag); });
++			bench("hessian_chain_psd", [&] {
++				polysolve::cl::proj_flag() = true;
++				P.set_project_to_psd(true);
++				P.hessian(x, H);
++			});
++			bench("hessian_chain", [&] {
++				polysolve::cl::proj_flag() = false;
++				P.set_project_to_psd(false);
++				P.hessian(x, H);
++			});
++			bench("step_valid", [&] { P.is_step_valid(x, y); });
++			bench("segment", [&] {
++				P.nonsmooth_segment_begin(x, y);
++				P.max_step_size(x, y);
++				P.nonsmooth_segment_end();
++			});
++			bench("solution_changed", [&] {
++				P.solution_changed(y);
++				P.solution_changed(x);
++			});
++			bench("full_reduced", [&] {
++				const Vec f = P.reduced_to_full(x);
++				P.full_to_reduced(f);
++			});
++			P.solution_changed(x);
++		}
++	} // namespace
++} // namespace polyfem::varforms
++
+ namespace polyfem::varform
+ {
+ 	using namespace solver;
+@@ -1526,6 +1651,8 @@
+ 
+ 		if (nonsmooth)
+ 			nl_problem.set_nonsmooth_term(make_nonsmooth_term(args["solver"]["nonlinear"]));
++		if (nonsmooth && std::getenv("POLYFEM_CL_BENCH") != nullptr && std::atoi(std::getenv("POLYFEM_CL_BENCH")) == step)
++			cl_bench(nl_problem, Eigen::Map<const Eigen::VectorXd>(sol.data(), sol.size()));
+ 		try
+ 		{
+ 			al_solver.solve_reduced(nl_problem, sol,

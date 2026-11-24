@@ -1,0 +1,865 @@
+{
+ "label": "bowl_19_it1000_blind",
+ "coverage": 0.9535604094214676,
+ "measured_ns": 276049104698.0,
+ "hook_ns": 3592941215.0,
+ "items": {
+  "G2": {
+   "est_ns": 13136870160.776804,
+   "meas_ns": 14404432129.0
+  },
+  "M": {
+   "est_ns": 2759921546.648525,
+   "meas_ns": 4640016415.0
+  },
+  "A2": {
+   "est_ns": 12726654208.025135,
+   "meas_ns": 16358663193.0
+  },
+  "V1": {
+   "est_ns": 13849462991.752138,
+   "meas_ns": 16256584154.0
+  },
+  "F2": {
+   "est_ns": 4189396132.602524,
+   "meas_ns": 4258311298.0
+  },
+  "C3": {
+   "est_ns": 5579854406.283684,
+   "meas_ns": 6540117946.0
+  },
+  "F3": {
+   "est_ns": 25840119206.523926,
+   "meas_ns": 24248981415.0
+  },
+  "E": {
+   "est_ns": 5747834518.540239,
+   "meas_ns": 6138512048.0
+  },
+  "C1": {
+   "est_ns": 80921522622.65913,
+   "meas_ns": 77506828252.0
+  },
+  "H1": {
+   "est_ns": 9723166972.605814,
+   "meas_ns": 12469755168.0
+  },
+  "G1": {
+   "est_ns": 9070844616.945883,
+   "meas_ns": 10526640312.0
+  },
+  "F1": {
+   "est_ns": 31430420944.87675,
+   "meas_ns": 30760548121.0
+  },
+  "A1": {
+   "est_ns": 24969191104.213875,
+   "meas_ns": 26894803442.0
+  },
+  "S1": {
+   "est_ns": 7035833687.611937,
+   "meas_ns": 7007065889.0
+  },
+  "C2": {
+   "est_ns": 15470655430.915659,
+   "meas_ns": 17063908588.0
+  },
+  "C0": {
+   "est_ns": 777748745.272415,
+   "meas_ns": 939542964.0
+  }
+ },
+ "categories": {
+  "G2.gradient": {
+   "est_ns": 115454288.303784,
+   "meas_ns": 32411071.0,
+   "calls": 3281.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "S.energy": {
+   "est_ns": 6861806.22348,
+   "meas_ns": 1076479.0,
+   "calls": 195.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "form.barrier-contact.grad": {
+   "est_ns": 1856712914.5716093,
+   "meas_ns": 1366794181.0,
+   "calls": 3443.0,
+   "units": 11855417.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.pressure.ls_end": {
+   "est_ns": 1333006.9114950185,
+   "meas_ns": 1357735.0,
+   "calls": 3404.0,
+   "units": 3404.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "N.residual": {
+   "est_ns": 100990998.94766401,
+   "meas_ns": 168646163.0,
+   "calls": 132.0,
+   "units": 255000960.0,
+   "basis": "model: one spmv and 3 vector operations"
+  },
+  "form.inertia.value": {
+   "est_ns": 50853231.63695586,
+   "meas_ns": 52102549.0,
+   "calls": 498.0,
+   "units": 498.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.barrier-contact.ls_end": {
+   "est_ns": 27242398.4338355,
+   "meas_ns": 37291981.0,
+   "calls": 3404.0,
+   "units": 3404.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "S.step": {
+   "est_ns": 4715292.481776,
+   "meas_ns": 1963459.0,
+   "calls": 134.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "F2.chain": {
+   "est_ns": 133118402.73649848,
+   "meas_ns": 122626984.0,
+   "calls": 4.0,
+   "units": 0.0,
+   "basis": "replay: analysis by nnz"
+  },
+  "NL.solution_changed": {
+   "est_ns": 2195489.0008506076,
+   "meas_ns": 1968089.0,
+   "calls": 268.0,
+   "units": 0.0,
+   "basis": "bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls"
+  },
+  "form.inertia.grad": {
+   "est_ns": 230480008.49197078,
+   "meas_ns": 233920301.0,
+   "calls": 3443.0,
+   "units": 3443.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "C3.build": {
+   "est_ns": 5445315041.260066,
+   "meas_ns": 6471863925.0,
+   "calls": 3810.0,
+   "units": 0.0,
+   "basis": "replay: collision-set builds by candidates (cached or with their own broad phase)"
+  },
+  "F3": {
+   "est_ns": 22855099429.48471,
+   "meas_ns": 21539727650.0,
+   "calls": 3413.0,
+   "units": 0.0,
+   "basis": "replay: back-substitution by lnz x calls (the share right after a factorization with the factor in the cache, the rest cold)"
+  },
+  "F3.chain": {
+   "est_ns": 24547088.958724596,
+   "meas_ns": 23281544.0,
+   "calls": 4.0,
+   "units": 0.0,
+   "basis": "replay: back-substitution by lnz x calls (right after its factorization)"
+  },
+  "NT.anchor": {
+   "est_ns": 4504681015.68236,
+   "meas_ns": 4497963166.0,
+   "calls": 130.0,
+   "units": 0.0,
+   "basis": "bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls"
+  },
+  "G2.set": {
+   "est_ns": 3271206285.0,
+   "meas_ns": 4598335067.0,
+   "calls": 3285.0,
+   "units": 3159917856.0,
+   "basis": "model: calls x the replay of the re-read correction (spmv, Q^T r, 5 vector operations; hot / cold mean)"
+  },
+  "A2.eval0": {
+   "est_ns": 119927.945024335,
+   "meas_ns": 30929959.0,
+   "calls": 6936.0,
+   "units": 6760031787.0,
+   "basis": "model: k x k"
+  },
+  "form.barrier-contact.ls_begin": {
+   "est_ns": 22025693.106381852,
+   "meas_ns": 32310666.0,
+   "calls": 3404.0,
+   "units": 3404.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "H1.residual": {
+   "est_ns": 3044164.173804,
+   "meas_ns": 3970800.0,
+   "calls": 4.0,
+   "units": 7685514.0,
+   "basis": "model: one spmv and 3 vector operations"
+  },
+  "NT.exact_part": {
+   "est_ns": 216670243.19371793,
+   "meas_ns": 674906593.0,
+   "calls": 196.0,
+   "units": 448067.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "NL.value": {
+   "est_ns": 10528882.731849508,
+   "meas_ns": 11537603.0,
+   "calls": 498.0,
+   "units": 0.0,
+   "basis": "bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls"
+  },
+  "NL.hessian": {
+   "est_ns": 12928477.713234885,
+   "meas_ns": 12998147.0,
+   "calls": 4.0,
+   "units": 0.0,
+   "basis": "bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls"
+  },
+  "A2.delta": {
+   "est_ns": 2023353.11718,
+   "meas_ns": 32654819.0,
+   "calls": 4.0,
+   "units": 6347655.0,
+   "basis": "model: initialization of the basis arrays"
+  },
+  "V1.jacobian_limit": {
+   "est_ns": 119641749.5376,
+   "meas_ns": 8391509.0,
+   "calls": 3400.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "NT.segment_begin": {
+   "est_ns": 5595640.1440306725,
+   "meas_ns": 10046155.0,
+   "calls": 3400.0,
+   "units": 0.0,
+   "basis": "bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls"
+  },
+  "NL.full_to_reduced": {
+   "est_ns": 485498188.9422773,
+   "meas_ns": 20394591.0,
+   "calls": 701.0,
+   "units": 41471160.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.elastic.post_step": {
+   "est_ns": 5383878.729192,
+   "meas_ns": 107838.0,
+   "calls": 153.0,
+   "units": 153.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "NT.update": {
+   "est_ns": 128614880.75292,
+   "meas_ns": 61008577.0,
+   "calls": 3655.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "form.body.hess": {
+   "est_ns": 113569.95003961214,
+   "meas_ns": 112223.0,
+   "calls": 4.0,
+   "units": 4.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "H1.assemble": {
+   "est_ns": 140754.999456,
+   "meas_ns": 36201.0,
+   "calls": 4.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "F1.chain": {
+   "est_ns": 861544084.6332444,
+   "meas_ns": 1028244296.0,
+   "calls": 4.0,
+   "units": 0.0,
+   "basis": "replay: as F1"
+  },
+  "A1": {
+   "est_ns": 24969191104.213875,
+   "meas_ns": 26894803442.0,
+   "calls": 3419.0,
+   "units": 18584184.0,
+   "basis": "replay: the exported blocks, form of the run"
+  },
+  "FNL.sum": {
+   "est_ns": 141369238.1328488,
+   "meas_ns": 149328672.0,
+   "calls": 17215.0,
+   "units": 1018439400.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "H1.chain": {
+   "est_ns": 140754.999456,
+   "meas_ns": 4055869.0,
+   "calls": 4.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "FNL.hess_sum": {
+   "est_ns": 63531707.40114948,
+   "meas_ns": 62518322.0,
+   "calls": 20.0,
+   "units": 8261019.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "NL.is_step_valid": {
+   "est_ns": 75400.69538348296,
+   "meas_ns": 95868.0,
+   "calls": 8.0,
+   "units": 0.0,
+   "basis": "bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls"
+  },
+  "S1": {
+   "est_ns": 7035833687.611937,
+   "meas_ns": 7007065889.0,
+   "calls": 130.0,
+   "units": 11205091.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "C1.build": {
+   "est_ns": 80869544564.25781,
+   "meas_ns": 77416651437.0,
+   "calls": 3404.0,
+   "units": 0.0,
+   "basis": "replay: broad phase by vertices and candidates"
+  },
+  "form.elastic.ls_end": {
+   "est_ns": 2069670.4963796842,
+   "meas_ns": 2473334.0,
+   "calls": 3404.0,
+   "units": 3404.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "NL.line_search_begin": {
+   "est_ns": 24356725.150915146,
+   "meas_ns": 47819994.0,
+   "calls": 3404.0,
+   "units": 0.0,
+   "basis": "bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls"
+  },
+  "NT.gradient": {
+   "est_ns": 57006424.88323873,
+   "meas_ns": 124274941.0,
+   "calls": 130.0,
+   "units": 588445.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "NT.smooth_hessian": {
+   "est_ns": 4677309890.385953,
+   "meas_ns": 5228468301.0,
+   "calls": 130.0,
+   "units": 8142053.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.elastic.ls_begin": {
+   "est_ns": 1754039.02871587,
+   "meas_ns": 2486133.0,
+   "calls": 3404.0,
+   "units": 3404.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.inertia.post_step": {
+   "est_ns": 5383878.729192,
+   "meas_ns": 69840.0,
+   "calls": 153.0,
+   "units": 153.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "C2.narrow": {
+   "est_ns": 15444389610.970898,
+   "meas_ns": 17026712753.0,
+   "calls": 3404.0,
+   "units": 0.0,
+   "basis": "replay: certificate pass by candidates + replay of all the Tight Inclusion queries of the run (1734436 weighted)"
+  },
+  "S.post_step": {
+   "est_ns": 4715292.481776,
+   "meas_ns": 3594322.0,
+   "calls": 134.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "CC.displace": {
+   "est_ns": 777748745.272415,
+   "meas_ns": 939542964.0,
+   "calls": 48221.0,
+   "units": 682712918.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "CC.displace_miss": {
+   "est_ns": 520124911.739784,
+   "meas_ns": 1920323207.0,
+   "calls": 14781.0,
+   "units": 209269398.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "form.elastic.solution_changed": {
+   "est_ns": 177243.31899334816,
+   "meas_ns": 177708.0,
+   "calls": 268.0,
+   "units": 268.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "A2.lm": {
+   "est_ns": 4808504.4,
+   "meas_ns": 47579127.0,
+   "calls": 3400.0,
+   "units": 60629.0,
+   "basis": "model: dense k x k factorizations (2 tries)"
+  },
+  "F2": {
+   "est_ns": 4056277729.8660254,
+   "meas_ns": 4135684314.0,
+   "calls": 121.0,
+   "units": 0.0,
+   "basis": "replay: analysis by nnz"
+  },
+  "NT.smooth_gradient": {
+   "est_ns": 308233057.41445816,
+   "meas_ns": 363359311.0,
+   "calls": 130.0,
+   "units": 8142053.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.body.solution_changed": {
+   "est_ns": 108962.27346553383,
+   "meas_ns": 116739.0,
+   "calls": 268.0,
+   "units": 268.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.elastic.hess": {
+   "est_ns": 50814368.25331808,
+   "meas_ns": 59319802.0,
+   "calls": 4.0,
+   "units": 4.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.elastic.grad": {
+   "est_ns": 7046219365.590615,
+   "meas_ns": 7450124925.0,
+   "calls": 3443.0,
+   "units": 3443.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.pressure.post_step": {
+   "est_ns": 5383878.729192,
+   "meas_ns": 57184.0,
+   "calls": 153.0,
+   "units": 153.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "P.eval": {
+   "est_ns": 250403144.032224,
+   "meas_ns": 257480822.0,
+   "calls": 7116.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "form.barrier-contact.step_valid": {
+   "est_ns": 3061.0845082338074,
+   "meas_ns": 2947.0,
+   "calls": 8.0,
+   "units": 8.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.body.value": {
+   "est_ns": 8595414705.525787,
+   "meas_ns": 8310977697.0,
+   "calls": 498.0,
+   "units": 498.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "NT.value": {
+   "est_ns": 1276058051.2237594,
+   "meas_ns": 3011471476.0,
+   "calls": 3785.0,
+   "units": 20936990.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.inertia.step_valid": {
+   "est_ns": 3047.0487183397513,
+   "meas_ns": 2957.0,
+   "calls": 8.0,
+   "units": 8.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.body.ls_end": {
+   "est_ns": 1331953.4766310547,
+   "meas_ns": 1374432.0,
+   "calls": 3404.0,
+   "units": 3404.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "N.assemble": {
+   "est_ns": 388712314.613808,
+   "meas_ns": 588457160.0,
+   "calls": 130.0,
+   "units": 251148978.0,
+   "basis": "model: the sparse sum of the two parts (parallel::spadd: about 4 spmv-equivalents per nonzero)"
+  },
+  "F3.select": {
+   "est_ns": 2960472688.080492,
+   "meas_ns": 2685972221.0,
+   "calls": 441.0,
+   "units": 0.0,
+   "basis": "replay: back-substitution by lnz x calls (cold)"
+  },
+  "form.inertia.ls_begin": {
+   "est_ns": 2941856.7804459594,
+   "meas_ns": 1397705.0,
+   "calls": 3404.0,
+   "units": 3404.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "F1": {
+   "est_ns": 30568876860.243507,
+   "meas_ns": 29732303825.0,
+   "calls": 140.0,
+   "units": 0.0,
+   "basis": "replay: CHOLMOD time by flops, failed ones by the flops done"
+  },
+  "form.pressure.ls_begin": {
+   "est_ns": 1258551.4841853408,
+   "meas_ns": 1431195.0,
+   "calls": 3404.0,
+   "units": 3404.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "N.compute": {
+   "est_ns": 4715292.481776,
+   "meas_ns": 10182469.0,
+   "calls": 134.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "form.pressure.step_valid": {
+   "est_ns": 3073.5939162995055,
+   "meas_ns": 2956.0,
+   "calls": 8.0,
+   "units": 8.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "NL.gradient": {
+   "est_ns": 126870540.36428387,
+   "meas_ns": 157059030.0,
+   "calls": 3443.0,
+   "units": 0.0,
+   "basis": "bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls"
+  },
+  "form.pressure.value": {
+   "est_ns": 13791295.343345545,
+   "meas_ns": 14260479.0,
+   "calls": 498.0,
+   "units": 498.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.pressure.hess": {
+   "est_ns": 946784.0658010977,
+   "meas_ns": 978646.0,
+   "calls": 4.0,
+   "units": 4.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "S.direction": {
+   "est_ns": 4856047.481232,
+   "meas_ns": 405601.0,
+   "calls": 138.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "S.accept": {
+   "est_ns": 4715292.481776,
+   "meas_ns": 57904988.0,
+   "calls": 134.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "form.barrier-contact.post_step": {
+   "est_ns": 5383878.729192,
+   "meas_ns": 14711116.0,
+   "calls": 153.0,
+   "units": 153.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "NL.post_step": {
+   "est_ns": 5383878.729192,
+   "meas_ns": 1158638.0,
+   "calls": 153.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "N.take_step": {
+   "est_ns": 4574537.48232,
+   "meas_ns": 4023212.0,
+   "calls": 130.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "NT.active_distances": {
+   "est_ns": 833417772.0804789,
+   "meas_ns": 1202958724.0,
+   "calls": 3400.0,
+   "units": 18562694.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.inertia.ls_end": {
+   "est_ns": 1330542.9932099772,
+   "meas_ns": 1322288.0,
+   "calls": 3404.0,
+   "units": 3404.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "P.run": {
+   "est_ns": 7147186054.004227,
+   "meas_ns": 10057515923.0,
+   "calls": 130.0,
+   "units": 3329924616.0,
+   "basis": "model: inner steps x the replay of the operation sequence of one inner step (8 products with the n x k basis, ~22 vector operations; hot / cold mean), with the re-read one more spmv with B per added column"
+  },
+  "form.elastic.step_valid": {
+   "est_ns": 15880812.140036598,
+   "meas_ns": 16522318.0,
+   "calls": 8.0,
+   "units": 8.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "NT.hessian.psd": {
+   "est_ns": 3625365755.701258,
+   "meas_ns": 3756398012.0,
+   "calls": 130.0,
+   "units": 588445.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.barrier-contact.hess": {
+   "est_ns": 20588370.567907237,
+   "meas_ns": 18543082.0,
+   "calls": 4.0,
+   "units": 9324.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "A2.col": {
+   "est_ns": 3471408810.0,
+   "meas_ns": 4817177415.0,
+   "calls": 3411.0,
+   "units": 3153570201.0,
+   "basis": "model: calls x the replay of add_column (copy, spmv, k + 1 dots; hot / cold mean)"
+  },
+  "NL.reduced_to_full": {
+   "est_ns": 1633217075.6127262,
+   "meas_ns": 2547020411.0,
+   "calls": 67711.0,
+   "units": 3737444067.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.pressure.solution_changed": {
+   "est_ns": 103888.8743369568,
+   "meas_ns": 104268.0,
+   "calls": 268.0,
+   "units": 268.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.barrier-contact.value": {
+   "est_ns": 83373539.48224288,
+   "meas_ns": 84503075.0,
+   "calls": 498.0,
+   "units": 1234962.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "NT.step_length": {
+   "est_ns": 96857757.02475709,
+   "meas_ns": 114711259.0,
+   "calls": 3652.0,
+   "units": 0.0,
+   "basis": "bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls"
+  },
+  "NT.metric_diagonal": {
+   "est_ns": 514419.7712338302,
+   "meas_ns": 466246.0,
+   "calls": 19.0,
+   "units": 0.0,
+   "basis": "bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls"
+  },
+  "form.inertia.hess": {
+   "est_ns": 441071.34597218427,
+   "meas_ns": 378998.0,
+   "calls": 4.0,
+   "units": 4.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.body.grad": {
+   "est_ns": 59157297.861627154,
+   "meas_ns": 64334327.0,
+   "calls": 3443.0,
+   "units": 3443.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.body.post_step": {
+   "est_ns": 5383878.729192,
+   "meas_ns": 102720.0,
+   "calls": 153.0,
+   "units": 153.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "V1.true_energy": {
+   "est_ns": 4574537.48232,
+   "meas_ns": 919018.0,
+   "calls": 130.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "S.gradient": {
+   "est_ns": 5524633.728648,
+   "meas_ns": 312020.0,
+   "calls": 157.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "form.elastic.value": {
+   "est_ns": 756538209.5583619,
+   "meas_ns": 773597854.0,
+   "calls": 498.0,
+   "units": 498.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "form.body.step_valid": {
+   "est_ns": 5331.714178013012,
+   "meas_ns": 4659.0,
+   "calls": 8.0,
+   "units": 8.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "NT.jdets": {
+   "est_ns": 61960409.949186035,
+   "meas_ns": 64931831.0,
+   "calls": 130.0,
+   "units": 0.0,
+   "basis": "bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls"
+  },
+  "form.inertia.solution_changed": {
+   "est_ns": 103796.39336862015,
+   "meas_ns": 104535.0,
+   "calls": 268.0,
+   "units": 268.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "N.apply_delta": {
+   "est_ns": 879718.7466,
+   "meas_ns": 5184721.0,
+   "calls": 25.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "A2.alloc": {
+   "est_ns": 96065287.12872,
+   "meas_ns": 1240862.0,
+   "calls": 130.0,
+   "units": 301375620.0,
+   "basis": "model: initialization of the basis arrays"
+  },
+  "N.direction": {
+   "est_ns": 4574537.48232,
+   "meas_ns": 88636359.0,
+   "calls": 130.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "S.solution_changed": {
+   "est_ns": 668586.247416,
+   "meas_ns": 34267.0,
+   "calls": 19.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "S.verify_gradient": {
+   "est_ns": 5524633.728648,
+   "meas_ns": 400882.0,
+   "calls": 157.0,
+   "units": 0.0,
+   "basis": "model: 6 vector operations per call (glue)"
+  },
+  "NL.max_step_size": {
+   "est_ns": 26265819.944760863,
+   "meas_ns": 37195835.0,
+   "calls": 3404.0,
+   "units": 0.0,
+   "basis": "bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls"
+  },
+  "NT.hessian_blocks": {
+   "est_ns": 5945111193.434417,
+   "meas_ns": 8550445066.0,
+   "calls": 3465.0,
+   "units": 18840155.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "NT.smooth_valid_fraction": {
+   "est_ns": 846416340.269389,
+   "meas_ns": 1829077834.0,
+   "calls": 3569.0,
+   "units": 0.0,
+   "basis": "bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls"
+  },
+  "form.barrier-contact.solution_changed": {
+   "est_ns": 3728995.269846617,
+   "meas_ns": 5277355.0,
+   "calls": 268.0,
+   "units": 268.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "A2.eval": {
+   "est_ns": 1899476735.0,
+   "meas_ns": 1114282566.0,
+   "calls": 3419.0,
+   "units": 3354542478.0,
+   "basis": "model: calls x the replay of the derivative part of the model evaluation (2 products, 3 vector operations; hot / cold mean)"
+  },
+  "form.body.ls_begin": {
+   "est_ns": 1271053.94807416,
+   "meas_ns": 1350397.0,
+   "calls": 3404.0,
+   "units": 3404.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "NT.smooth_hessian.psd": {
+   "est_ns": 3479919111.3379455,
+   "meas_ns": 3671448947.0,
+   "calls": 10.0,
+   "units": 622887.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  },
+  "NT.min_jacobians": {
+   "est_ns": 2007054280.3752792,
+   "meas_ns": 2071775223.0,
+   "calls": 3400.0,
+   "units": 0.0,
+   "basis": "bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls"
+  },
+  "NT.min_jacobian": {
+   "est_ns": 69247442.30851023,
+   "meas_ns": 71338132.0,
+   "calls": 130.0,
+   "units": 0.0,
+   "basis": "bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls"
+  },
+  "form.pressure.grad": {
+   "est_ns": 232393797.57682472,
+   "meas_ns": 227849614.0,
+   "calls": 3443.0,
+   "units": 3443.0,
+   "basis": "bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units"
+  }
+ }
+}

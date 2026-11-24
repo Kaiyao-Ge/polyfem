@@ -1,0 +1,55 @@
+category estimate: mat3k_45_blind
+  thread CPU in the solves 18.187 s, of which the export hooks 0.480 s; the run itself 17.707 s (the reference of the check)
+
+item estimate s measured s   share  ratio  categories
+F1        3.194      3.215   18.2%   0.99  F1,F1.chain
+F2        0.498      0.487    2.8%   1.02  F2,F2.chain
+F3        0.657      0.730    4.1%   0.90  F3,F3.select,F3.chain
+C1        5.089      4.433   25.0%   1.15  C1.build,NL.line_search_begin,form.barrier-contact.ls_begin,NT.segment_begin
+C2        1.224      1.405    7.9%   0.87  C2.narrow,NL.max_step_size
+C3        1.599      1.682    9.5%   0.95  C3.build,NT.update,form.barrier-contact.solution_changed,NL.solution_changed
+C0        0.047      0.044    0.3%   1.05  CC.displace
+G1        1.151      1.007    5.7%   1.14  NT.smooth_hessian,NT.exact_part,N.assemble,NT.smooth_gradient
+S1        0.437      0.501    2.8%   0.87  S1
+A1        0.766      0.752    4.2%   1.02  A1
+A2        0.311      0.402    2.3%   0.77  P.run,A2.col,N.residual,A2.eval,N.direction,A2.lm...
+G2        0.425      0.451    2.5%   0.94  form.elastic.grad,G2.set,form.barrier-contact.grad,NL.gradient,form.inertia.grad,form.pressure.grad...
+H1        1.132      1.227    6.9%   0.92  NT.hessian.psd,NT.hessian_blocks,FNL.hess_sum,form.elastic.hess,NL.hessian,form.barrier-contact.hess...
+V1        0.446      0.503    2.8%   0.89  form.elastic.value,NT.smooth_valid_fraction,NT.value,NT.min_jacobians,form.elastic.step_valid,form.inertia.value...
+E         0.669      0.667    3.8%   1.00  NT.anchor,P.eval,NT.jdets,NT.step_length,NT.active_distances,NT.metric_diagonal
+M         0.278      0.181    1.0%   1.53  NL.reduced_to_full,CC.displace_miss,form.barrier-contact.ls_end,N.compute,S.post_step,S.step...
+
+estimate 17.925 s / measured 17.707 s = 1.012   (coverage target >= 0.95; categories not priced count as missing)
+
+category (>= 0.2% of the run)              est s    meas s  ratio      calls  basis
+C1.build                                   5.080     4.422   1.15        769  replay: broad phase by vertices and candidates
+F1                                         2.333     2.347   0.99        137  replay: CHOLMOD time by flops, failed ones by the flops done
+C3.build                                   1.591     1.673   0.95       1040  replay: collision-set builds by candidates (cached or with their own broad phase)
+C2.narrow                                  1.220     1.400   0.87        769  replay: certificate pass by candidates + replay of all the Tight Inclusion queries of the run (186657 weighted)
+F1.chain                                   0.861     0.868   0.99         50  replay: as F1
+A1                                         0.766     0.752   1.02        719  replay: the exported blocks, form of the run
+NT.smooth_hessian                          0.976     0.719   1.36        137  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+NT.hessian.psd                             0.658     0.675   0.97        137  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+NT.anchor                                  0.639     0.624   1.02        137  bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls
+S1                                         0.437     0.501   0.87        137  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+F3                                         0.388     0.498   0.78        719  replay: back-substitution by lnz x calls (the share right after a factorization with the factor in the cache, the rest cold)
+NT.hessian_blocks                          0.237     0.302   0.79        754  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+F2                                         0.302     0.297   1.01         69  replay: analysis by nnz
+form.elastic.grad                          0.270     0.271   0.99        910  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+form.elastic.value                         0.227     0.221   1.03        982  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+P.run                                      0.148     0.209   0.71        137  model: inner steps x the replay of the operation sequence of one inner step (8 products with the n x k basis, ~22 vector operations; hot / cold mean), with the re-read one more spmv with B per added column
+F3.select                                  0.248     0.205   1.21        439  replay: back-substitution by lnz x calls (cold)
+F2.chain                                   0.196     0.190   1.04         45  replay: analysis by nnz
+NT.exact_part                              0.051     0.158   0.32        270  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+A2.col                                     0.113     0.132   0.85        703  model: calls x the replay of add_column (copy, spmv, k + 1 dots; hot / cold mean)
+FNL.hess_sum                               0.116     0.117   1.00        250  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+G2.set                                     0.093     0.110   0.85        582  model: calls x the replay of the re-read correction (spmv, Q^T r, 5 vector operations; hot / cold mean)
+NL.reduced_to_full                         0.091     0.091   1.00      18098  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+form.elastic.hess                          0.079     0.081   0.97         50  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+N.assemble                                 0.059     0.080   0.74        137  model: the sparse sum of the two parts (parallel::spadd: about 4 spmv-equivalents per nonzero)
+NT.smooth_valid_fraction                   0.040     0.075   0.53        823  bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls
+NT.value                                   0.034     0.071   0.47        891  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+NT.min_jacobians                           0.069     0.064   1.08        753  bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls
+CC.displace_miss                           0.013     0.050   0.26       2254  model: 6 vector operations per call (glue)
+NT.smooth_gradient                         0.065     0.050   1.30        137  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+CC.displace                                0.047     0.044   1.05      12405  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units

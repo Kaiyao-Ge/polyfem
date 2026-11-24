@@ -1,0 +1,41 @@
+category estimate: slide_20
+  thread CPU in the solves 2.999 s, of which the export hooks 0.011 s; the run itself 2.988 s (the reference of the check)
+
+item estimate s measured s   share  ratio  categories
+F1        0.112      0.095    3.2%   1.19  F1,F1.chain
+F2        0.020      0.020    0.7%   0.97  F2.chain,F2
+F3        0.008      0.007    0.2%   1.13  F3,F3.chain,F3.select
+C1        0.071      0.063    2.1%   1.13  C1.build,NL.line_search_begin,form.barrier-contact.ls_begin,NT.segment_begin
+C2        2.335      2.304   77.1%   1.01  C2.narrow,NL.max_step_size
+C3        0.016      0.019    0.7%   0.83  C3.build,NL.solution_changed,NT.update,form.barrier-contact.solution_changed
+C0        0.002      0.002    0.1%   1.26  CC.displace
+G1        0.107      0.105    3.5%   1.02  NT.smooth_hessian,NT.smooth_gradient,N.assemble
+A1        0.004      0.004    0.1%   1.03  A1
+A2        0.037      0.008    0.3%   4.38  P.run,A2.col,N.residual,A2.eval,N.direction,A2.lm...
+G2        0.036      0.027    0.9%   1.29  form.elastic.grad,form.friction.grad,form.barrier-contact.grad,NL.gradient,NT.gradient,form.pressure.grad...
+H1        0.131      0.123    4.1%   1.07  form.elastic.hess,NT.hessian.psd,FNL.hess_sum,NT.hessian_blocks,form.barrier-contact.hess,form.friction.hess...
+V1        0.211      0.171    5.7%   1.24  form.body.value,form.elastic.value,form.elastic.step_valid,form.friction.value,NL.value,form.barrier-contact.value...
+E         0.023      0.024    0.8%   0.93  NT.anchor,NT.active_distances,P.eval,NT.step_length,NT.jdets,NT.metric_diagonal...
+M         0.008      0.009    0.3%   0.89  NL.reduced_to_full,S.step,CC.displace_miss,S.post_step,form.barrier-contact.post_step,NL.post_step...
+
+estimate 3.123 s / measured 2.988 s = 1.045   (coverage target >= 0.95; categories not priced count as missing)
+
+category (>= 0.2% of the run)              est s    meas s  ratio      calls  basis
+C2.narrow                                  2.328     2.304   1.01        144  replay: certificate pass by candidates + replay of all the Tight Inclusion queries of the run (1970 weighted)
+form.body.value                            0.119     0.102   1.17        428  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+NT.smooth_hessian                          0.098     0.097   1.01         35  bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls
+form.elastic.hess                          0.083     0.077   1.08         32  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+C1.build                                   0.070     0.062   1.13        144  replay: broad phase by vertices and candidates
+F1                                         0.059     0.050   1.19         35  replay: CHOLMOD time by flops, failed ones by the flops done
+F1.chain                                   0.054     0.045   1.19         32  replay: as F1
+form.elastic.value                         0.059     0.043   1.38        428  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+NT.anchor                                  0.021     0.022   0.94         33  bench: ns per call of the isolated repeats (hot / cold geometric mean) x calls
+form.elastic.grad                          0.028     0.021   1.35        142  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+C3.build                                   0.015     0.018   0.82        200  replay: collision-set builds by candidates (cached or with their own broad phase)
+NT.hessian.psd                             0.016     0.017   0.91         35  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+form.elastic.step_valid                    0.014     0.011   1.29         71  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+FNL.hess_sum                               0.012     0.010   1.13        192  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+F2.chain                                   0.010     0.010   0.97         20  replay: analysis by nnz
+F2                                         0.010     0.010   0.98         20  replay: analysis by nnz
+NT.hessian_blocks                          0.009     0.007   1.28        142  bench: ns per unit of the isolated repeats (hot / cold geometric mean) x units
+F3                                         0.007     0.006   1.17        144  replay: back-substitution by lnz x calls (the share right after a factorization with the factor in the cache, the rest cold)
